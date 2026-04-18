@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
-from typing import Iterable
 
 
 def fuzzy_score(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+    left = (a or "").strip().lower()
+    right = (b or "").strip().lower()
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if left in right or right in left:
+        return 0.92
+    return SequenceMatcher(None, left, right).ratio()
 
 
-def best_text_matches(query: str, candidates: Iterable[str], limit: int = 10) -> list[str]:
-    scored = sorted(
-        ((candidate, fuzzy_score(query, candidate)) for candidate in candidates),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    return [candidate for candidate, _ in scored[:limit]]
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
-def clamp(n: float, low: float, high: float) -> float:
-    return max(low, min(n, high))
+def fmt_credits(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:,.0f} aUEC"
+
+
+def fmt_number(value: float | None, digits: int = 2) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:,.{digits}f}"
