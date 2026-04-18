@@ -10,7 +10,7 @@ BRAND_FOOTER = "Citizen AI • Star Citizen Utility Bot"
 
 
 def _base_embed(title: str, description: str | None = None, *, color: discord.Color) -> discord.Embed:
-    embed = discord.Embed(title=title, description=description or discord.Embed.Empty, color=color)
+    embed = discord.Embed(title=title, description=description or None, color=color)
     embed.set_footer(text=BRAND_FOOTER)
     return embed
 
