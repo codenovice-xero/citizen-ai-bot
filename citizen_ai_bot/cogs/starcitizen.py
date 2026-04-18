@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from ..formatters import commodity_embed, item_embed, route_embed, status_embed
 from ..services import StarCitizenService
+
+log = logging.getLogger(__name__)
 
 
 class StarCitizenCog(commands.Cog):
@@ -57,12 +62,28 @@ class StarCitizenCog(commands.Cog):
         cargo_scu: float | None = None,
     ) -> None:
         await interaction.response.defer(thinking=True)
-        route = await self.service.suggest_trade_route(
-            commodity_name=commodity,
-            from_location=from_location,
-            budget=budget,
-            cargo_scu=cargo_scu,
-        )
+        try:
+            route = await asyncio.wait_for(
+                self.service.suggest_trade_route(
+                    commodity_name=commodity,
+                    from_location=from_location,
+                    budget=budget,
+                    cargo_scu=cargo_scu,
+                ),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "Route search timed out while waiting on live market data. Please try again in a moment."
+            )
+            return
+        except Exception as exc:
+            log.exception("Route command failed for commodity=%s", commodity)
+            await interaction.followup.send(
+                f"Route lookup failed for **{commodity}**: `{type(exc).__name__}`."
+            )
+            return
+
         if route is None:
             await interaction.followup.send(
                 f"I couldn't find a route suggestion for **{commodity}** with the current live data."
