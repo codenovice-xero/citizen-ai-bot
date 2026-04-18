@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .models import ItemLocation, ItemMatch, RouteSuggestion
@@ -10,6 +11,9 @@ from .utils import fuzzy_score
 class StarCitizenService:
     def __init__(self, client: UEXClient) -> None:
         self.client = client
+        self._items_prices_all_cache: list[dict[str, Any]] = []
+        self._items_prices_all_cache_ts: float = 0.0
+        self._items_prices_all_cache_ttl: int = 60 * 30  # 30 minutes
 
     @staticmethod
     def _extract_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -24,28 +28,62 @@ class StarCitizenService:
                 return value
         return []
 
-    async def search_items(self, query: str, limit: int = 8) -> list[ItemMatch]:
-        payload = await self.client.get("/items")
+    async def _get_items_prices_all(self) -> list[dict[str, Any]]:
+        now = time.time()
+        if self._items_prices_all_cache and (now - self._items_prices_all_cache_ts) < self._items_prices_all_cache_ttl:
+            return self._items_prices_all_cache
+
+        payload = await self.client.get("/items_prices_all")
         records = self._extract_records(payload)
-        ranked = sorted(
-            records,
-            key=lambda r: max(
-                fuzzy_score(query, str(r.get("name", ""))),
-                fuzzy_score(query, str(r.get("section", ""))),
-                fuzzy_score(query, str(r.get("category", ""))),
-            ),
-            reverse=True,
-        )
+
+        self._items_prices_all_cache = records
+        self._items_prices_all_cache_ts = now
+        return records
+
+    async def search_items(self, query: str, limit: int = 8) -> list[ItemMatch]:
+        records = await self._get_items_prices_all()
+        query = query.strip()
+
+        seen: dict[Any, dict[str, Any]] = {}
+        for record in records:
+            item_name = str(record.get("item_name", "") or "").strip()
+            if not item_name:
+                continue
+
+            score = fuzzy_score(query, item_name)
+            if query.lower() not in item_name.lower() and score < 0.72:
+                continue
+
+            item_id = record.get("id_item")
+            dedupe_key = item_id if item_id is not None else item_name.lower()
+
+            if dedupe_key not in seen:
+                seen[dedupe_key] = {
+                    "id_item": item_id,
+                    "item_name": item_name,
+                    "category": record.get("section") or record.get("category"),
+                    "company_name": record.get("company_name"),
+                    "size": record.get("size"),
+                    "score": score,
+                    "raw": record,
+                }
+            else:
+                if score > seen[dedupe_key]["score"]:
+                    seen[dedupe_key]["score"] = score
+                    seen[dedupe_key]["raw"] = record
+
+        ranked = sorted(seen.values(), key=lambda r: r["score"], reverse=True)
+
         results: list[ItemMatch] = []
         for record in ranked[:limit]:
             results.append(
                 ItemMatch(
-                    name=str(record.get("name", "Unknown Item")),
-                    uuid=record.get("uuid"),
+                    name=str(record.get("item_name", "Unknown Item")),
+                    uuid=record.get("id_item"),
                     category=str(record.get("category", "")) or None,
                     company=str(record.get("company_name", "")) or None,
                     size=str(record.get("size", "")) or None,
-                    raw=record,
+                    raw=record.get("raw", record),
                 )
             )
         return results
@@ -55,28 +93,26 @@ class StarCitizenService:
         if not item_matches:
             return [], []
 
-        locations: list[ItemLocation] = []
+        best_match = item_matches[0]
+        item_id = best_match.uuid
+
+        if item_id is None:
+            return item_matches, []
+
         try:
-            payload = await self.client.get("/items_prices")
+            payload = await self.client.get("/items_prices", params={"id_item": item_id})
             records = self._extract_records(payload)
         except Exception:
             records = []
 
-        match_names = {match.name.lower() for match in item_matches}
+        locations: list[ItemLocation] = []
         for record in records:
-            record_item_name = str(record.get("item_name", "") or record.get("name", ""))
-            if record_item_name.lower() not in match_names and fuzzy_score(item_name, record_item_name) < 0.75:
-                continue
-            location_name = str(
-                record.get("terminal_name")
-                or record.get("store_name")
-                or record.get("location_name")
-                or record.get("city_name")
-                or "Unknown Location"
-            )
+            record_item_name = str(record.get("item_name", "") or best_match.name)
+            location_name = self._location_label(record)
+
             locations.append(
                 ItemLocation(
-                    item_name=record_item_name or item_matches[0].name,
+                    item_name=record_item_name,
                     location_name=location_name,
                     terminal_name=record.get("terminal_name") or record.get("store_name"),
                     buy_price=self._safe_float(record.get("price_buy") or record.get("buy_price")),
@@ -85,6 +121,13 @@ class StarCitizenService:
                     raw=record,
                 )
             )
+
+        def location_sort_key(loc: ItemLocation) -> tuple[int, float]:
+            buy_price = loc.buy_price if loc.buy_price is not None else float("inf")
+            has_terminal = 0 if loc.terminal_name else 1
+            return (has_terminal, buy_price)
+
+        locations = sorted(locations, key=location_sort_key)
         return item_matches, locations[:limit]
 
     async def search_commodity(self, commodity_name: str, limit: int = 10) -> list[ItemMatch]:
@@ -127,8 +170,6 @@ class StarCitizenService:
         budget: float | None = None,
         cargo_scu: float | None = None,
     ) -> RouteSuggestion | None:
-        # /commodities_routes requires at least one id_* input. Use /commodities_prices
-        # with commodity_name, then derive the best buy/sell pair client-side.
         payload = await self.client.get("/commodities_prices", params={"commodity_name": commodity_name})
         records = self._extract_records(payload)
         if not records:
@@ -142,7 +183,14 @@ class StarCitizenService:
             if from_location:
                 candidate = " ".join(
                     str(record.get(key) or "")
-                    for key in ("terminal_name", "city_name", "outpost_name", "space_station_name", "planet_name", "moon_name")
+                    for key in (
+                        "terminal_name",
+                        "city_name",
+                        "outpost_name",
+                        "space_station_name",
+                        "planet_name",
+                        "moon_name",
+                    )
                 )
                 if fuzzy_score(from_location, candidate) < 0.55:
                     continue
@@ -173,7 +221,10 @@ class StarCitizenService:
 
         if self._location_label(buy_row) == self._location_label(sell_row):
             alternatives = sorted(sell_candidates, key=sell_score)
-            sell_row = next((row for row in alternatives if self._location_label(row) != self._location_label(buy_row)), sell_row)
+            sell_row = next(
+                (row for row in alternatives if self._location_label(row) != self._location_label(buy_row)),
+                sell_row,
+            )
 
         buy_price = self._safe_float(buy_row.get("price_buy"))
         sell_price = self._safe_float(sell_row.get("price_sell"))
