@@ -41,53 +41,60 @@ class StarCitizenService:
         return records
 
     async def search_items(self, query: str, limit: int = 8) -> list[ItemMatch]:
-        records = await self._get_items_prices_all()
-        query = query.strip()
+    records = await self._get_items_prices_all()
+    query = query.strip().lower()
 
-        seen: dict[Any, dict[str, Any]] = {}
-        for record in records:
-            item_name = str(record.get("item_name", "") or "").strip()
-            if not item_name:
-                continue
+    seen: dict[Any, dict[str, Any]] = {}
 
-            score = fuzzy_score(query, item_name)
-            if query.lower() not in item_name.lower() and score < 0.72:
-                continue
+    for record in records:
+        item_name = str(record.get("item_name", "") or "").strip()
+        if not item_name:
+            continue
 
-            item_id = record.get("id_item")
-            dedupe_key = item_id if item_id is not None else item_name.lower()
+        item_name_lower = item_name.lower()
 
-            if dedupe_key not in seen:
-                seen[dedupe_key] = {
-                    "id_item": item_id,
-                    "item_name": item_name,
-                    "category": record.get("section") or record.get("category"),
-                    "company_name": record.get("company_name"),
-                    "size": record.get("size"),
-                    "score": score,
-                    "raw": record,
-                }
-            else:
-                if score > seen[dedupe_key]["score"]:
-                    seen[dedupe_key]["score"] = score
-                    seen[dedupe_key]["raw"] = record
+        # Strong match if the query is contained anywhere in the item name
+        contains_match = query in item_name_lower
 
-        ranked = sorted(seen.values(), key=lambda r: r["score"], reverse=True)
+        # Fall back to fuzzy score
+        score = fuzzy_score(query, item_name_lower)
 
-        results: list[ItemMatch] = []
-        for record in ranked[:limit]:
-            results.append(
-                ItemMatch(
-                    name=str(record.get("item_name", "Unknown Item")),
-                    uuid=record.get("id_item"),
-                    category=str(record.get("category", "")) or None,
-                    company=str(record.get("company_name", "")) or None,
-                    size=str(record.get("size", "")) or None,
-                    raw=record.get("raw", record),
-                )
+        # Much looser acceptance rule
+        if not contains_match and score < 0.45:
+            continue
+
+        item_id = record.get("id_item")
+        dedupe_key = item_id if item_id is not None else item_name_lower
+
+        # Boost substring matches above fuzzy-only matches
+        effective_score = 1.0 if contains_match else score
+
+        if dedupe_key not in seen or effective_score > seen[dedupe_key]["score"]:
+            seen[dedupe_key] = {
+                "id_item": item_id,
+                "item_name": item_name,
+                "category": record.get("section") or record.get("category"),
+                "company_name": record.get("company_name"),
+                "size": record.get("size"),
+                "score": effective_score,
+                "raw": record,
+            }
+
+    ranked = sorted(seen.values(), key=lambda r: r["score"], reverse=True)
+
+    results: list[ItemMatch] = []
+    for record in ranked[:limit]:
+        results.append(
+            ItemMatch(
+                name=str(record.get("item_name", "Unknown Item")),
+                uuid=record.get("id_item"),
+                category=str(record.get("category", "")) or None,
+                company=str(record.get("company_name", "")) or None,
+                size=str(record.get("size", "")) or None,
+                raw=record.get("raw", record),
             )
-        return results
-
+        )
+    return results
     async def get_item_locations(self, item_name: str, limit: int = 10) -> tuple[list[ItemMatch], list[ItemLocation]]:
         item_matches = await self.search_items(item_name, limit=5)
         if not item_matches:
