@@ -11,7 +11,7 @@ class UEXClient:
     def __init__(self) -> None:
         headers = {
             "Accept": "application/json",
-            "User-Agent": "CitizenAI-DiscordBot/0.1",
+            "User-Agent": "CitizenAI-DiscordBot/0.3",
         }
         if settings.uex_api_token.strip():
             headers["Authorization"] = f"Bearer {settings.uex_api_token.strip()}"
