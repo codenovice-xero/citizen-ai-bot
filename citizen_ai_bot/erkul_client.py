@@ -8,7 +8,7 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-_ERKUL_API_BASE = "https://erkul.games/api/v2"
+_ERKUL_API_BASE = "https://www.erkul.games/api/v2"
 _CACHE_TTL = 60 * 30  # 30 minutes
 
 
@@ -29,6 +29,7 @@ class ErkulClient:
         self._http = httpx.AsyncClient(
             base_url=_ERKUL_API_BASE,
             timeout=timeout,
+            follow_redirects=True,
             headers={
                 "Accept": "application/json",
                 "User-Agent": "CitizenAI-DiscordBot/0.3",
