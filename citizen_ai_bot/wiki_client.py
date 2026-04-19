@@ -52,66 +52,51 @@ class WikiClient:
     async def _fetch_ship_data(self, ship_name: str) -> dict[str, Any] | None:
         """Query the Wiki API for *ship_name* and return the raw ship dict.
 
-        The Star Citizen Wiki API supports querying ships by name directly via
-        the ``/ships`` endpoint with a ``query`` parameter.  Returns the first
-        matching result, or ``None`` if nothing is found or the API fails.
+        The Star Citizen Wiki API exposes individual vehicle records at
+        ``/vehicles/{ship_name}`` where the ship name is passed as a URL path
+        parameter.  Returns the ship dict directly, or ``None`` if the ship is
+        not found or the API fails.
         """
+        endpoint = f"/vehicles/{ship_name}"
         try:
-            response = await self._http.get(
-                "/ships",
-                params={"query": ship_name, "limit": 5},
-            )
+            response = await self._http.get(endpoint)
             response.raise_for_status()
 
             content_type = response.headers.get("content-type", "")
             if "json" not in content_type:
                 log.warning(
-                    "Star Citizen Wiki /ships returned unexpected content-type %r; body: %.500s",
+                    "Star Citizen Wiki %s returned unexpected content-type %r; body: %.500s",
+                    endpoint,
                     content_type,
                     response.text,
                 )
                 return None
 
             if not response.text or not response.text.strip():
-                log.warning("Star Citizen Wiki /ships returned an empty response body")
+                log.warning("Star Citizen Wiki %s returned an empty response body", endpoint)
                 return None
 
             payload = response.json()
         except httpx.HTTPError as exc:
-            log.warning("Star Citizen Wiki /ships request failed for %r: %s", ship_name, exc)
+            log.warning("Star Citizen Wiki %s request failed for %r: %s", endpoint, ship_name, exc)
             return None
         except Exception as exc:
             log.warning("Star Citizen Wiki unexpected error fetching %r: %s", ship_name, exc)
             return None
 
-        # The Wiki API wraps results in a "data" key containing a list.
+        # The /vehicles/{ship_name} endpoint returns a single ship object directly.
         if isinstance(payload, dict):
-            data = payload.get("data") or []
-        elif isinstance(payload, list):
-            data = payload
-        else:
-            log.warning(
-                "Star Citizen Wiki /ships returned unexpected payload type %s",
-                type(payload).__name__,
-            )
-            return None
+            if not payload:
+                log.debug("Star Citizen Wiki: no results for ship %r", ship_name)
+                return None
+            return payload
 
-        if not data:
-            log.debug("Star Citizen Wiki: no results for ship %r", ship_name)
-            return None
-
-        target = _norm_ship_name(ship_name)
-
-        # Prefer an exact normalised name match; fall back to the first result.
-        for entry in data:
-            if not isinstance(entry, dict):
-                continue
-            candidate = _norm_ship_name(str(entry.get("name") or ""))
-            if candidate == target:
-                return entry
-
-        first = data[0] if isinstance(data[0], dict) else None
-        return first
+        log.warning(
+            "Star Citizen Wiki %s returned unexpected payload type %s",
+            endpoint,
+            type(payload).__name__,
+        )
+        return None
 
     @staticmethod
     def _extract_hardpoints(ship_data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
