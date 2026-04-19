@@ -77,7 +77,11 @@ class WikiClient:
                 return None
 
             payload = response.json()
-            log.debug("Star Citizen Wiki response for %r: %.1000s", ship_name, str(payload))
+            log.warning(
+                "Star Citizen Wiki raw response for %r: %.2000s",
+                ship_name,
+                str(payload),
+            )
         except httpx.HTTPError as exc:
             log.warning("Star Citizen Wiki %s request failed for %r: %s", endpoint, ship_name, exc)
             return None
