@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-
 import discord
-from discord import app_commands
 from discord.ext import commands
 
-from ..config import settings
 from ..formatters import (
     error_embed,
     format_advice,
@@ -21,32 +17,37 @@ from ..formatters import (
     help_embed,
     status_embed,
 )
-from ..services import StarCitizenService
-from ..uex_client import UEXClient
-
-log = logging.getLogger(__name__)
 
 
 class StarCitizenCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.client = UEXClient()
-        self.service = StarCitizenService(self.client)
+        self.service = getattr(bot, "sc_service", None) or getattr(bot, "service", None)
 
-    async def cog_unload(self) -> None:
-        await self.client.close()
+    @discord.app_commands.command(name="helpme", description="Show Citizen AI commands")
+    async def helpme(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=help_embed())
 
-    @app_commands.command(name="item", description="Find where an in-game item can be bought or sold")
+    @discord.app_commands.command(name="status", description="Check bot and API status")
+    async def status(self, interaction: discord.Interaction) -> None:
+        healthy = False
+        try:
+            if self.service and getattr(self.service.client, "ping", None):
+                healthy = await self.service.client.ping()
+        except Exception:
+            healthy = False
+        await interaction.response.send_message(embed=status_embed(healthy))
+
+    @discord.app_commands.command(name="item", description="Find where an item can be bought or sold")
     async def item(self, interaction: discord.Interaction, name: str) -> None:
         await interaction.response.defer(thinking=True)
         try:
-            matches, locations = await asyncio.wait_for(self.service.get_item_locations(name), timeout=20)
+            matches, locations = await self.service.get_item_locations(name)
             await interaction.followup.send(embed=format_item_result(matches, locations))
-        except Exception as exc:
-            log.exception("item command failed")
-            await interaction.followup.send(embed=error_embed("Item Lookup Failed", str(exc)))
+        except Exception as e:
+            await interaction.followup.send(embed=error_embed("Item Lookup Failed", str(e)))
 
-    @app_commands.command(name="route", description="Find the best current route for a commodity")
+    @discord.app_commands.command(name="route", description="Find the best trade route for a commodity")
     async def route(
         self,
         interaction: discord.Interaction,
@@ -69,16 +70,13 @@ class StarCitizenCog(commands.Cog):
                 timeout=20,
             )
             if not route:
-                await interaction.followup.send(
-                    embed=error_embed("No Route Found", "No route matched that commodity and filter set.")
-                )
+                await interaction.followup.send(embed=error_embed("Route Lookup", "No route found for that query."))
                 return
             await interaction.followup.send(embed=format_route(route))
-        except Exception as exc:
-            log.exception("route command failed")
-            await interaction.followup.send(embed=error_embed("Route Lookup Failed", str(exc)))
+        except Exception as e:
+            await interaction.followup.send(embed=error_embed("Route Lookup Failed", str(e)))
 
-    @app_commands.command(name="multiroute", description="Show several route options for a commodity")
+    @discord.app_commands.command(name="multiroute", description="Show multiple good trade routes")
     async def multiroute(
         self,
         interaction: discord.Interaction,
@@ -102,11 +100,10 @@ class StarCitizenCog(commands.Cog):
                 timeout=20,
             )
             await interaction.followup.send(embed=format_route_list(routes))
-        except Exception as exc:
-            log.exception("multiroute failed")
-            await interaction.followup.send(embed=error_embed("Multi-Route Lookup Failed", str(exc)))
+        except Exception as e:
+            await interaction.followup.send(embed=error_embed("Multi-Route Lookup Failed", str(e)))
 
-    @app_commands.command(name="advice", description="Get money-making guidance based on your ship and bankroll")
+    @discord.app_commands.command(name="advice", description="Get activity advice based on money and ship")
     async def advice(
         self,
         interaction: discord.Interaction,
@@ -114,58 +111,64 @@ class StarCitizenCog(commands.Cog):
         ship: str | None = None,
         risk_tolerance: str | None = None,
     ) -> None:
-        plan = self.service.advice_for_player(money=money, ship=ship, risk_tolerance=risk_tolerance)
-        await interaction.response.send_message(embed=format_advice(plan))
+        try:
+            plan = self.service.advice_for_player(money, ship, risk_tolerance)
+            await interaction.response.send_message(embed=format_advice(plan))
+        except Exception as e:
+            await interaction.response.send_message(embed=error_embed("Advice Failed", str(e)))
 
-    @app_commands.command(name="loadout", description="Show a curated loadout recommendation for a ship")
+    @discord.app_commands.command(name="loadout", description="Get a recommended ship loadout")
     async def loadout(self, interaction: discord.Interaction, ship: str) -> None:
-        suggestion = self.service.suggest_loadout(ship)
-        await interaction.response.send_message(embed=format_loadout(suggestion, ship))
+        try:
+            loadout = self.service.suggest_loadout(ship)
+            await interaction.response.send_message(embed=format_loadout(loadout, ship))
+        except Exception as e:
+            await interaction.response.send_message(embed=error_embed("Loadout Failed", str(e)))
 
-    @app_commands.command(name="mining", description="Show a curated mining plan for a mining ship")
+    @discord.app_commands.command(name="mining", description="Get a mining setup recommendation")
     async def mining(self, interaction: discord.Interaction, ship: str) -> None:
-        suggestion = self.service.suggest_mining(ship)
-        await interaction.response.send_message(embed=format_mining(suggestion, ship))
+        try:
+            plan = self.service.suggest_mining(ship)
+            await interaction.response.send_message(embed=format_mining(plan, ship))
+        except Exception as e:
+            await interaction.response.send_message(embed=error_embed("Mining Failed", str(e)))
 
-    @app_commands.command(name="missions", description="Show mission progression advice")
+    @discord.app_commands.command(name="missions", description="Get mission-path guidance")
     async def missions(self, interaction: discord.Interaction, mission_type: str) -> None:
-        plan = self.service.mission_plan(mission_type)
-        await interaction.response.send_message(embed=format_advice(plan))
+        try:
+            plan = self.service.mission_plan(mission_type)
+            await interaction.response.send_message(embed=format_advice(plan))
+        except Exception as e:
+            await interaction.response.send_message(embed=error_embed("Mission Guidance Failed", str(e)))
 
-    @app_commands.command(name="risk", description="Estimate route risk between two locations")
+    @discord.app_commands.command(name="risk", description="Estimate route risk between two places")
     async def risk(self, interaction: discord.Interaction, buy_location: str, sell_location: str, legal_only: bool = False) -> None:
-        label, notes = self.service.estimate_route_risk(buy_location, sell_location, legal_only=legal_only)
-        await interaction.response.send_message(embed=format_risk(label, notes))
+        try:
+            label, notes = self.service.estimate_route_risk(buy_location, sell_location, legal_only=legal_only)
+            await interaction.response.send_message(embed=format_risk(label, notes))
+        except Exception as e:
+            await interaction.response.send_message(embed=error_embed("Risk Failed", str(e)))
 
-    @app_commands.command(name="trend", description="Show a current-market snapshot for a commodity")
+    @discord.app_commands.command(name="trend", description="Show current commodity snapshot")
     async def trend(self, interaction: discord.Interaction, commodity: str) -> None:
         await interaction.response.defer(thinking=True)
         try:
-            snapshot = await asyncio.wait_for(self.service.price_snapshot(commodity), timeout=20)
+            snapshot = await self.service.price_snapshot(commodity)
             if not snapshot:
-                await interaction.followup.send(embed=error_embed("No Snapshot Found", "No commodity snapshot matched that query."))
+                await interaction.followup.send(embed=error_embed("Trend Lookup", "No market snapshot found for that commodity."))
                 return
             await interaction.followup.send(embed=format_trend(snapshot))
-        except Exception as exc:
-            log.exception("trend failed")
-            await interaction.followup.send(embed=error_embed("Trend Lookup Failed", str(exc)))
+        except Exception as e:
+            await interaction.followup.send(embed=error_embed("Trend Failed", str(e)))
 
-    @app_commands.command(name="op", description="Generate a simple org-op checklist")
+    @discord.app_commands.command(name="op", description="Create a simple org operation checklist")
     async def op(self, interaction: discord.Interaction, event: str) -> None:
-        plan = self.service.plan_operation(event)
-        await interaction.response.send_message(embed=format_advice(plan))
-
-    @app_commands.command(name="status", description="Check API and bot health")
-    async def status(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=True)
-        healthy = await self.client.ping()
-        await interaction.followup.send(embed=status_embed(healthy))
-
-    @app_commands.command(name="helpme", description="Show quick command help")
-    async def helpme(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=help_embed())
+        try:
+            plan = self.service.plan_operation(event)
+            await interaction.response.send_message(embed=format_advice(plan))
+        except Exception as e:
+            await interaction.response.send_message(embed=error_embed("Operation Planner Failed", str(e)))
 
 
 async def setup(bot: commands.Bot) -> None:
-    cog = StarCitizenCog(bot)
-    await bot.add_cog(cog, guild=discord.Object(id=settings.discord_guild_id) if settings.discord_guild_id else None)
+    await bot.add_cog(StarCitizenCog(bot))

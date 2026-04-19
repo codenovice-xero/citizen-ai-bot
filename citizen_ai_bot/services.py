@@ -130,29 +130,6 @@ class StarCitizenService:
 
         return item_matches, sorted(locations, key=location_sort_key)[:limit]
 
-    async def search_commodity(self, commodity_name: str, limit: int = 10) -> list[ItemMatch]:
-        payload = await self.client.get("/commodities_prices", params={"commodity_name": commodity_name})
-        records = self._extract_records(payload)
-        seen: set[str] = set()
-        ranked = sorted(
-            records,
-            key=lambda r: fuzzy_score(commodity_name, str(r.get("commodity_name", ""))),
-            reverse=True,
-        )
-
-        matches: list[ItemMatch] = []
-        for record in ranked:
-            name = str(record.get("commodity_name", "") or "Unknown Commodity")
-            slug = str(record.get("commodity_slug", "") or "")
-            dedupe_key = slug or name.lower()
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            matches.append(ItemMatch(name=name, uuid=None, category="Commodity", raw=record))
-            if len(matches) >= limit:
-                break
-        return matches
-
     async def _get_commodity_prices(self, commodity_name: str) -> list[dict[str, Any]]:
         now = time.time()
         key = commodity_name.strip().lower()
@@ -188,29 +165,11 @@ class StarCitizenService:
             label = "Low"
         elif score < 0.48:
             label = "Moderate"
-        elif score < 0.7:
+        elif score < 0.70:
             label = "High"
         else:
             label = "Extreme"
         return label, notes
-
-    async def suggest_trade_route(
-        self,
-        commodity_name: str,
-        from_location: str | None = None,
-        budget: float | None = None,
-        cargo_scu: float | None = None,
-        legal_only: bool = False,
-    ) -> RouteSuggestion | None:
-        routes = await self.list_trade_routes(
-            commodity_name=commodity_name,
-            from_location=from_location,
-            budget=budget,
-            cargo_scu=cargo_scu,
-            legal_only=legal_only,
-            limit=1,
-        )
-        return routes[0] if routes else None
 
     async def list_trade_routes(
         self,
@@ -299,11 +258,26 @@ class StarCitizenService:
                 break
         return deduped
 
+    async def suggest_trade_route(
+        self,
+        commodity_name: str,
+        from_location: str | None = None,
+        budget: float | None = None,
+        cargo_scu: float | None = None,
+        legal_only: bool = False,
+    ) -> RouteSuggestion | None:
+        routes = await self.list_trade_routes(
+            commodity_name=commodity_name,
+            from_location=from_location,
+            budget=budget,
+            cargo_scu=cargo_scu,
+            legal_only=legal_only,
+            limit=1,
+        )
+        return routes[0] if routes else None
+
     def advice_for_player(self, money: float | None, ship: str | None, risk_tolerance: str | None) -> AdvicePlan:
         return build_advice_plan(money=money, ship=ship)
-
-    def get_ship_cargo(self, ship_name: str | None) -> float | None:
-        return None
 
     def suggest_loadout(self, ship_name: str) -> LoadoutSuggestion | None:
         return get_loadout_suggestion(ship_name)
