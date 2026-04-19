@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -61,7 +62,29 @@ class ErkulClient:
 
         response = await self._http.get("/ships")
         response.raise_for_status()
-        payload = response.json()
+
+        # Validate that the response actually contains JSON before parsing.
+        content_type = response.headers.get("content-type", "")
+        if "json" not in content_type:
+            log.warning(
+                "erkul.games /ships returned unexpected content-type %r; body: %.500s",
+                content_type,
+                response.text,
+            )
+
+        if not response.text or not response.text.strip():
+            log.warning("erkul.games /ships returned an empty response body")
+            return []
+
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "erkul.games /ships JSON decode error: %s — raw response (first 500 chars): %.500s",
+                exc,
+                response.text,
+            )
+            return []
 
         # The API may return a list directly or wrap it in a "data" key.
         if isinstance(payload, list):
@@ -69,10 +92,16 @@ class ErkulClient:
         elif isinstance(payload, dict):
             ships = payload.get("data") or payload.get("ships") or []
         else:
+            log.warning(
+                "erkul.games /ships returned unexpected payload type %s; body: %.500s",
+                type(payload).__name__,
+                response.text,
+            )
             ships = []
 
         self._ships_cache = (now, ships)
         return ships
+
 
     def _find_ship_in_list(
         self, ships: list[dict[str, Any]], ship_name: str
@@ -239,14 +268,35 @@ class ErkulClient:
             try:
                 resp = await self._http.get(f"/ships/{ship_id}")
                 resp.raise_for_status()
-                detail_payload = resp.json()
-                if isinstance(detail_payload, dict):
-                    match = detail_payload.get("data") or detail_payload
+
+                if not resp.text or not resp.text.strip():
+                    log.warning(
+                        "erkul.games /ships/%s returned an empty response body for %r",
+                        ship_id,
+                        ship_name,
+                    )
+                else:
+                    try:
+                        detail_payload = resp.json()
+                    except json.JSONDecodeError as exc:
+                        log.warning(
+                            "erkul.games /ships/%s JSON decode error for %r: %s"
+                            " — raw response (first 500 chars): %.500s",
+                            ship_id,
+                            ship_name,
+                            exc,
+                            resp.text,
+                        )
+                        detail_payload = None
+
+                    if isinstance(detail_payload, dict):
+                        match = detail_payload.get("data") or detail_payload
             except httpx.HTTPError as exc:
                 log.warning("erkul.games detail fetch failed for %r: %s", ship_name, exc)
                 # Fall through with the list-level data we already have.
             except Exception as exc:
                 log.warning("erkul.games unexpected error fetching ship detail for %r: %s", ship_name, exc)
+
 
         self._ship_detail_cache[key] = (now, match)
         return match
