@@ -3,10 +3,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from .erkul_client import ErkulClient
 from .models import AdvicePlan, ItemLocation, ItemMatch, LoadoutSuggestion, MiningSuggestion, RouteSuggestion
 from .static_data import (
     MISSION_GUIDE,
     build_advice_plan,
+    get_erkul_loadout,
     get_loadout_suggestion,
     get_mining_suggestion,
 )
@@ -17,6 +19,7 @@ from .utils import clamp, fuzzy_score
 class StarCitizenService:
     def __init__(self, client: UEXClient) -> None:
         self.client = client
+        self.erkul = ErkulClient()
         self._items_prices_all_cache: list[dict[str, Any]] = []
         self._items_prices_all_cache_ts: float = 0.0
         self._items_prices_all_cache_ttl: int = 60 * 30
@@ -279,8 +282,15 @@ class StarCitizenService:
     def advice_for_player(self, money: float | None, ship: str | None, risk_tolerance: str | None) -> AdvicePlan:
         return build_advice_plan(money=money, ship=ship)
 
-    def suggest_loadout(self, ship_name: str) -> LoadoutSuggestion | None:
-        return get_loadout_suggestion(ship_name)
+    async def suggest_loadout(self, ship_name: str) -> LoadoutSuggestion | None:
+        """Return a loadout suggestion for *ship_name*.
+
+        Attempts to enrich the curated suggestion with live hardpoint and
+        performance data from erkul.games.  Falls back gracefully to the
+        curated / dynamic suggestion if the API is unavailable.
+        """
+        erkul_data = await get_erkul_loadout(ship_name, self.erkul)
+        return get_loadout_suggestion(ship_name, erkul_enrichment=erkul_data)
 
     def suggest_mining(self, ship_name: str) -> MiningSuggestion | None:
         return get_mining_suggestion(ship_name)

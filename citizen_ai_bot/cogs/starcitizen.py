@@ -119,11 +119,12 @@ class StarCitizenCog(commands.Cog):
 
     @discord.app_commands.command(name="loadout", description="Get a recommended ship loadout")
     async def loadout(self, interaction: discord.Interaction, ship: str) -> None:
+        await interaction.response.defer(thinking=True)
         try:
-            loadout = self.service.suggest_loadout(ship)
-            await interaction.response.send_message(embed=format_loadout(loadout, ship))
+            loadout = await self.service.suggest_loadout(ship)
+            await interaction.followup.send(embed=format_loadout(loadout, ship))
         except Exception as e:
-            await interaction.response.send_message(embed=error_embed("Loadout Failed", str(e)))
+            await interaction.followup.send(embed=error_embed("Loadout Failed", str(e)))
 
     @discord.app_commands.command(name="mining", description="Get a mining setup recommendation")
     async def mining(self, interaction: discord.Interaction, ship: str) -> None:
