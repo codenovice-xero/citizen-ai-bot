@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from typing import Any
 
 from .models import AdvicePlan, ItemLocation, ItemMatch, LoadoutSuggestion, MiningSuggestion, RouteSuggestion
-from .static_data import LOADOUTS, MINING, MISSION_ADVICE, SHIP_CARGO_SCU
+from .static_data import (
+    MISSION_GUIDE,
+    build_advice_plan,
+    get_loadout_suggestion,
+    get_mining_suggestion,
+)
 from .uex_client import UEXClient
 from .utils import clamp, fuzzy_score
 
@@ -296,139 +300,38 @@ class StarCitizenService:
         return deduped
 
     def advice_for_player(self, money: float | None, ship: str | None, risk_tolerance: str | None) -> AdvicePlan:
-        ship_lower = (ship or "").strip().lower()
-        money = money or 0
-        risk_tolerance = (risk_tolerance or "balanced").strip().lower()
-
-        if ship_lower in SHIP_CARGO_SCU and money >= 100_000:
-            title = "Trading Focus"
-            bullets = [
-                f"Your ship has viable cargo space for real route play ({SHIP_CARGO_SCU[ship_lower]} SCU reference).",
-                "Run safe repeatable loops first, then scale into better-margin commodities.",
-                "Keep a reserve instead of risking your whole bankroll on a single run.",
-            ]
-            if risk_tolerance in {"high", "aggressive"}:
-                bullets.append("Use the /risk command before committing to frontier or outpost-heavy routes.")
-            return AdvicePlan(title=title, summary="Your strongest current path is structured hauling.", bullets=bullets)
-
-        if ship_lower in {"prospector", "mole", "golem"}:
-            return AdvicePlan(
-                title="Mining Focus",
-                summary="Your ship profile points toward extraction income.",
-                bullets=[
-                    "Use /mining for tuned module guidance.",
-                    "Mine selectively; skipped bad rocks are profit too.",
-                    "Refine high-value material instead of dumping raw cargo for convenience.",
-                ],
-            )
-
-        if ship_lower in {"vulture", "reclaimer"}:
-            return AdvicePlan(
-                title="Salvage Focus",
-                summary="Salvage is a strong low-chaos income path for your setup.",
-                bullets=[
-                    "Prioritize uptime and efficient sell cadence.",
-                    "Avoid long unnecessary repositioning between jobs.",
-                    "Use combat escorts only when the route justifies it.",
-                ],
-            )
-
-        if money < 100_000:
-            return AdvicePlan(
-                title="Capital Build-Up",
-                summary="You need quick, repeatable income before heavier trading makes sense.",
-                bullets=[
-                    "Lean into bunker, mercenary, bounty, or salvage loops.",
-                    "Do not overextend on trade cargo with a small bankroll.",
-                    "Use /missions to pick the fastest progression track for your current session.",
-                ],
-            )
-
-        return AdvicePlan(
-            title="Balanced Progression",
-            summary="You are in a good spot to pivot between routes, contracts, and specialization.",
-            bullets=[
-                "Use /route for direct profit targets and /multiroute for alternatives.",
-                "Use /loadout before combat-heavy grinds to reduce wasted resets.",
-                "Choose activities based on your session length and tolerance for PvP interruptions.",
-            ],
-        )
+        return build_advice_plan(money=money, ship=ship)
 
     def get_ship_cargo(self, ship_name: str | None) -> float | None:
-        if not ship_name:
-            return None
-        needle = ship_name.strip().lower()
-        best_key = None
-        best_score = 0.0
-        for key in SHIP_CARGO_SCU:
-            score = fuzzy_score(needle, key)
-            if score > best_score:
-                best_key = key
-                best_score = score
-        if best_key and best_score >= 0.55:
-            return float(SHIP_CARGO_SCU[best_key])
         return None
 
     def suggest_loadout(self, ship_name: str) -> LoadoutSuggestion | None:
-        ship_lower = ship_name.strip().lower()
-        best_key = None
-        best_score = 0.0
-        for key in LOADOUTS:
-            score = fuzzy_score(ship_lower, key)
-            if score > best_score:
-                best_key = key
-                best_score = score
-        if not best_key or best_score < 0.55:
-            return None
-        data = LOADOUTS[best_key]
-        return LoadoutSuggestion(
-            ship_name=best_key.title(),
-            role=data["role"],
-            weapons=data["weapons"],
-            shields=data["shields"],
-            power=data["power"],
-            coolers=data["coolers"],
-            notes=data["notes"],
-        )
+        return get_loadout_suggestion(ship_name)
 
     def suggest_mining(self, ship_name: str) -> MiningSuggestion | None:
-        ship_lower = ship_name.strip().lower()
-        best_key = None
-        best_score = 0.0
-        for key in MINING:
-            score = fuzzy_score(ship_lower, key)
-            if score > best_score:
-                best_key = key
-                best_score = score
-        if not best_key or best_score < 0.55:
-            return None
-        data = MINING[best_key]
-        return MiningSuggestion(
-            ship_name=best_key.title(),
-            modules=data["modules"],
-            focus=data["focus"],
-            notes=data["notes"],
-        )
+        return get_mining_suggestion(ship_name)
 
     def mission_plan(self, mission_type: str) -> AdvicePlan:
         mission_type = mission_type.strip().lower()
         best_key = None
         best_score = 0.0
-        for key in MISSION_ADVICE:
+        for key in MISSION_GUIDE:
             score = fuzzy_score(mission_type, key)
             if score > best_score:
                 best_key = key
                 best_score = score
+
         if not best_key:
             return AdvicePlan(
                 title="Mission Planning",
-                summary="Use mission types like bounty, cargo, mining, or salvage.",
-                bullets=["Pick the gameplay loop that matches your ship and bankroll."],
+                summary="Use mission types like combat, cargo, mining, or starter.",
+                bullets=["Choose the loop that matches your ship and bankroll."],
             )
+
         return AdvicePlan(
             title=f"{best_key.title()} Progression",
             summary=f"Guidance for {best_key}-focused sessions.",
-            bullets=MISSION_ADVICE[best_key],
+            bullets=MISSION_GUIDE[best_key],
         )
 
     async def price_snapshot(self, commodity_name: str) -> dict[str, Any] | None:
