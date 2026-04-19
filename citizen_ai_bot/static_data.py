@@ -249,136 +249,391 @@ async def get_wiki_loadout(
         return None
 
 
+def _classify_ship_type(ship_data: dict) -> str:
+    """Determine a ship's role based on its performance stats.
+
+    Classification priority (highest to lowest):
+    - Transport: very high cargo (> 500 SCU)
+    - Miner: high cargo (> 100 SCU), low agility, small crew
+    - Dropship: high cargo (> 200 SCU), medium agility, crew 2+
+    - Interceptor: very high max speed (> 1200 m/s), high agility, low cargo
+    - Fighter: high agility (roll/pitch/yaw > 100), medium cargo (< 100 SCU), crew 1-2
+    - Gunship: many weapon hardpoints, medium-high cargo, crew 2+
+    - Exploration: medium cargo, medium speed, good shields
+    - Multirole: fallback
+    """
+    performance: dict = ship_data.get("performance") or {}
+    hardpoints: dict = ship_data.get("hardpoints") or {}
+
+    cargo: float = float(performance.get("cargo_scu") or 0)
+    max_speed: float = float(performance.get("max_speed") or 0)
+    max_crew: int = int(performance.get("max_crew") or 1)
+    shield_hp: float = float(performance.get("shield_hp") or 0)
+
+    # Agility proxies — the Wiki API may expose these under different keys;
+    # we read them from the raw performance dict if present.
+    roll: float = float(performance.get("roll") or performance.get("roll_rate") or 0)
+    pitch: float = float(performance.get("pitch") or performance.get("pitch_rate") or 0)
+    yaw: float = float(performance.get("yaw") or performance.get("yaw_rate") or 0)
+    high_agility: bool = any(v > 100 for v in (roll, pitch, yaw))
+
+    weapon_count: int = len(hardpoints.get("weapons") or [])
+    missile_count: int = len(hardpoints.get("missiles") or [])
+    total_firepower: int = weapon_count + missile_count
+
+    # --- Classification rules (order matters) ---
+    if cargo > 500:
+        return "Transport"
+
+    if cargo > 200 and max_crew >= 2:
+        return "Dropship"
+
+    if cargo > 100 and max_crew <= 2 and not high_agility:
+        return "Miner"
+
+    if max_speed > 1200 and high_agility and cargo < 50:
+        return "Interceptor"
+
+    if high_agility and cargo < 100 and max_crew <= 2:
+        return "Fighter"
+
+    if total_firepower >= 6 and max_crew >= 2:
+        return "Gunship"
+
+    if 20 <= cargo <= 200 and shield_hp > 0 and max_speed > 0:
+        return "Exploration"
+
+    return "Multirole"
+
+
+# ---------------------------------------------------------------------------
+# Weapon type label helpers
+# ---------------------------------------------------------------------------
+
+_GENERIC_WEAPON_NAMES: frozenset[str] = frozenset({
+    "weapon", "weapons", "gun", "guns", "laser", "cannon", "repeater",
+    "ballistic", "energy", "hardpoint",
+})
+
+_GENERIC_COMPONENT_NAMES: frozenset[str] = frozenset({
+    "shield", "shield generator", "shields",
+    "power plant", "power", "powerplant",
+    "cooler", "coolers",
+})
+
+
+def _clean_component_name(hp: dict) -> str:
+    """Return a human-readable component label from a hardpoint entry dict.
+
+    Filters out generic placeholder names (e.g. "Weapon", "Shield Generator")
+    and constructs a richer label from size, class, type, and manufacturer
+    fields when the raw name is too generic.
+    """
+    raw_name: str = str(hp.get("component_name") or "").strip()
+    comp_class: str | None = hp.get("component_class")
+    size: str | None = hp.get("size")
+    manufacturer: str | None = hp.get("manufacturer")
+
+    # Detect whether the raw name is too generic to be useful
+    is_generic = _norm(raw_name) in _GENERIC_WEAPON_NAMES or _norm(raw_name) in _GENERIC_COMPONENT_NAMES
+
+    if raw_name and not is_generic:
+        # Good name — just annotate with size/class/manufacturer if missing
+        parts: list[str] = []
+        if size:
+            parts.append(f"Size {size}")
+        if comp_class:
+            parts.append(f"Class {comp_class}")
+        parts.append(raw_name)
+        if manufacturer:
+            parts.append(f"({manufacturer})")
+        return " ".join(parts)
+
+    # Build a synthetic name from available metadata
+    parts = []
+    if size:
+        parts.append(f"Size {size}")
+    if comp_class:
+        parts.append(f"Class {comp_class}")
+    # Use the raw name as a type hint even if generic, unless it's completely empty
+    if raw_name:
+        parts.append(raw_name.title())
+    if manufacturer:
+        parts.append(f"({manufacturer})")
+    return " ".join(parts) if parts else "Unknown Component"
+
+
+def _recommend_weapons(ship_type: str, hardpoints: dict) -> list[str]:
+    """Return a list of weapon recommendation strings for *ship_type*.
+
+    Uses the actual hardpoint data (sizes, counts) from the Wiki API when
+    available, and falls back to role-based generic advice otherwise.
+    """
+    weapon_hps: list[dict] = hardpoints.get("weapons") or []
+    missile_hps: list[dict] = hardpoints.get("missiles") or []
+    recommendations: list[str] = []
+
+    # --- Role-based primary weapon advice ---
+    role_advice: dict[str, list[str]] = {
+        "Fighter": [
+            "Ballistic cannons for high burst alpha damage",
+            "Laser repeaters for sustained pressure and easier pip tracking",
+        ],
+        "Interceptor": [
+            "Light laser repeaters — low heat, high fire rate for fast passes",
+            "Avoid heavy weapons; keep the loadout light for maximum speed",
+        ],
+        "Gunship": [
+            "Mixed loadout: heavy cannons on pilot hardpoints for alpha damage",
+            "Turret repeaters for sustained suppression",
+            "Missile racks for opening-burst pressure",
+        ],
+        "Miner": [
+            "Minimal defensive weapons only — prioritise mining laser modules",
+            "Keep a light repeater for emergency deterrence",
+        ],
+        "Dropship": [
+            "Defensive repeaters on turrets for escort deterrence",
+            "Avoid heavy pilot weapons; cargo capacity is the priority",
+        ],
+        "Transport": [
+            "Defensive repeaters only — do not build this as a brawler",
+            "Turret coverage matters more than pilot weapon alpha",
+        ],
+        "Exploration": [
+            "Balanced repeater setup for opportunistic PvE",
+            "Missiles for burst damage against unexpected threats",
+        ],
+        "Multirole": [
+            "General-purpose laser repeaters for flexible PvE",
+            "Optional missile package for burst opening pressure",
+        ],
+    }
+    for line in role_advice.get(ship_type, role_advice["Multirole"]):
+        recommendations.append(line)
+
+    # --- Actual Wiki hardpoint data ---
+    if weapon_hps:
+        spec_counts: Counter = Counter(
+            _clean_component_name(hp) for hp in weapon_hps if _clean_component_name(hp)
+        )
+        if spec_counts:
+            lines = [
+                f"{cnt}× {spec}" if cnt > 1 else spec
+                for spec, cnt in spec_counts.most_common(6)
+            ]
+            recommendations.append("Equipped: " + ", ".join(lines))
+        else:
+            sizes = sorted({str(hp["size"]) for hp in weapon_hps if hp.get("size")})
+            if sizes:
+                recommendations.append(
+                    f"{len(weapon_hps)} weapon slot(s) — sizes {', '.join(sizes)}"
+                )
+            else:
+                recommendations.append(f"{len(weapon_hps)} weapon hardpoint(s)")
+
+    if missile_hps:
+        spec_counts_m: Counter = Counter(
+            _clean_component_name(hp) for hp in missile_hps if _clean_component_name(hp)
+        )
+        if spec_counts_m:
+            lines_m = [
+                f"{cnt}× {spec}" if cnt > 1 else spec
+                for spec, cnt in spec_counts_m.most_common(4)
+            ]
+            recommendations.append("Missiles: " + ", ".join(lines_m))
+        else:
+            recommendations.append(f"{len(missile_hps)} missile hardpoint(s)")
+
+    return recommendations
+
+
+def _recommend_components(ship_type: str, performance: dict) -> dict[str, str]:
+    """Return component recommendations keyed by slot type for *ship_type*.
+
+    Values are short advisory strings that describe the ideal component
+    class/priority for the ship's role.  Actual Wiki component data is
+    overlaid by :func:`_enrich_loadout` after this function runs.
+    """
+    shield_hp: float = float(performance.get("shield_hp") or 0)
+    shield_note = f" ({shield_hp:,.0f} HP from Wiki)" if shield_hp else ""
+
+    recommendations: dict[str, dict[str, str]] = {
+        "Fighter": {
+            "shields": f"Class A fast-recharge shield — recover quickly between passes{shield_note}",
+            "power": "Military or competition power plant — responsive output for combat bursts",
+            "coolers": "Class A high-efficiency cooler — sustained heat from repeated weapon fire",
+        },
+        "Interceptor": {
+            "shields": f"Lightweight fast-recharge shield — minimise mass{shield_note}",
+            "power": "Competition power plant — prioritise speed over raw output",
+            "coolers": "Efficient cooler — light repeaters still generate heat at high fire rates",
+        },
+        "Gunship": {
+            "shields": f"Class A heavy shield — sustain in prolonged engagements{shield_note}",
+            "power": "Military-grade power plant — heavy weapon demand requires stable output",
+            "coolers": "High-capacity coolers — sustained turret and pilot weapon fire",
+        },
+        "Miner": {
+            "shields": f"Industrial shield — survivability over combat performance{shield_note}",
+            "power": "Industrial power plant — mining lasers draw significant power",
+            "coolers": "Industrial cooler — steady heat from continuous mining laser use",
+        },
+        "Dropship": {
+            "shields": f"Military shield with good sustain — protect the cargo bay{shield_note}",
+            "power": "Reliable military power plant — balance weapons and life support",
+            "coolers": "Balanced coolers for mixed combat and transit operation",
+        },
+        "Transport": {
+            "shields": f"Heavy industrial shield — absorb hits while escaping{shield_note}",
+            "power": "High-stability industrial power plant — cargo weight demands consistent output",
+            "coolers": "Reliable large-frame coolers for long-haul operation",
+        },
+        "Exploration": {
+            "shields": f"Military shield with strong sustain — unknown-space survivability{shield_note}",
+            "power": "Reliable military power plant for extended range",
+            "coolers": "Balanced coolers for mixed transit and combat readiness",
+        },
+        "Multirole": {
+            "shields": f"Balanced shield setup{shield_note}",
+            "power": "Reliable all-around power plant",
+            "coolers": "Balanced coolers",
+        },
+    }
+    return recommendations.get(ship_type, recommendations["Multirole"])
+
+
 def _enrich_loadout(
     base: LoadoutSuggestion,
     wiki_data: dict,
 ) -> LoadoutSuggestion:
-    """Return a new :class:`LoadoutSuggestion` enriched with Star Citizen Wiki API data.
+    """Return a new :class:`LoadoutSuggestion` built from data-driven recommendations.
 
-    The curated text is preserved; Wiki data is appended as additional
-    context so users see both the opinionated guidance *and* the real
-    hardpoint/performance numbers from the API.
+    Replaces the old curated-text-plus-appended-Wiki approach with a fully
+    data-driven pipeline:
 
-    When detailed component data is available (weapon sizes, component names,
-    classes, and manufacturers) it is formatted into human-readable lines.
-    When only count data is available the output falls back to simple counts.
+    1. Classify the ship's role via :func:`_classify_ship_type`.
+    2. Generate role-appropriate weapon recommendations via
+       :func:`_recommend_weapons`, incorporating actual Wiki hardpoint specs.
+    3. Generate role-appropriate component recommendations via
+       :func:`_recommend_components`, incorporating actual Wiki component specs.
+    4. Overlay real Wiki component names/sizes/classes/manufacturers on top of
+       the advisory text so users see both the *why* and the *what*.
+    5. Append performance metrics as a concise summary note.
     """
     hardpoints: dict = wiki_data.get("hardpoints") or {}
     performance: dict = wiki_data.get("performance") or {}
     wiki_ship_name: str = wiki_data.get("ship_name") or base.ship_name
 
     # ------------------------------------------------------------------
-    # Helper: build a compact spec string for a single component entry
+    # 1. Classify ship type from Wiki data
+    # ------------------------------------------------------------------
+    ship_type = _classify_ship_type({"performance": performance, "hardpoints": hardpoints})
+
+    # Map ship type to a display role label (override curated role if we have
+    # enough data to be confident about the classification)
+    _type_to_role: dict[str, str] = {
+        "Fighter": "Light Fighter",
+        "Interceptor": "Interceptor",
+        "Gunship": "Gunship",
+        "Miner": "Mining / Industrial",
+        "Dropship": "Dropship / Assault Transport",
+        "Transport": "Heavy Transport",
+        "Exploration": "Exploration / Multirole",
+        "Multirole": "Multirole",
+    }
+    # Only override the curated role when we have real performance data to
+    # base the classification on; otherwise keep the curated label.
+    has_perf_data = bool(performance.get("max_speed") or performance.get("cargo_scu") or performance.get("max_crew"))
+    role = _type_to_role.get(ship_type, base.role) if has_perf_data else base.role
+
+    # ------------------------------------------------------------------
+    # 2. Weapon recommendations (role-based + Wiki hardpoint specs)
+    # ------------------------------------------------------------------
+    weapons = _recommend_weapons(ship_type, hardpoints)
+
+    # ------------------------------------------------------------------
+    # 3. Component recommendations (role-based advisory text)
+    # ------------------------------------------------------------------
+    comp_recs = _recommend_components(ship_type, performance)
+
+    # ------------------------------------------------------------------
+    # Helper: build a detailed spec string for a single component entry,
+    # filtering out generic placeholder names.
     # ------------------------------------------------------------------
     def _comp_spec(hp: dict) -> str:
-        """Return a short human-readable spec string for one hardpoint entry."""
-        parts: list[str] = []
-        if hp.get("size"):
-            parts.append(f"Size {hp['size']}")
-        if hp.get("component_class"):
-            parts.append(f"Class {hp['component_class']}")
-        if hp.get("component_name"):
-            parts.append(hp["component_name"])
-        if hp.get("manufacturer"):
-            parts.append(f"({hp['manufacturer']})")
-        return " ".join(parts) if parts else ""
+        return _clean_component_name(hp)
 
     def _has_detail(hps: list[dict]) -> bool:
         return any(hp.get("size") or hp.get("component_name") or hp.get("component_class") for hp in hps)
 
-    # --- Weapons ---
-    weapons = list(base.weapons)
-    weapon_hps = hardpoints.get("weapons") or []
-    if weapon_hps:
-        if _has_detail(weapon_hps):
-            # Group by size so we can show e.g. "4× Size 3 laser repeater"
-            spec_counts: Counter = Counter(_comp_spec(hp) for hp in weapon_hps if _comp_spec(hp))
-            if spec_counts:
-                lines = [f"{cnt}× {spec}" if cnt > 1 else spec for spec, cnt in spec_counts.most_common(6)]
-                weapons.append("Wiki weapons: " + ", ".join(lines) + (" …" if len(spec_counts) > 6 else ""))
-            else:
-                # Has detail fields but all empty — show sizes if present
-                sizes = sorted({str(hp["size"]) for hp in weapon_hps if hp.get("size")})
-                if sizes:
-                    weapons.append(f"Wiki: {len(weapon_hps)} weapon slot(s) — sizes {', '.join(sizes)}")
-                else:
-                    weapons.append(f"Wiki: {len(weapon_hps)} weapon hardpoint(s) detected")
-        else:
-            weapons.append(f"Wiki: {len(weapon_hps)} weapon hardpoint(s) detected")
-
-    missile_hps = hardpoints.get("missiles") or []
-    if missile_hps:
-        if _has_detail(missile_hps):
-            spec_counts: Counter = Counter(_comp_spec(hp) for hp in missile_hps if _comp_spec(hp))
-            if spec_counts:
-                lines = [f"{cnt}× {spec}" if cnt > 1 else spec for spec, cnt in spec_counts.most_common(4)]
-                weapons.append("Wiki missiles: " + ", ".join(lines))
-            else:
-                weapons.append(f"Wiki: {len(missile_hps)} missile hardpoint(s) detected")
-        else:
-            weapons.append(f"Wiki: {len(missile_hps)} missile hardpoint(s) detected")
-
-    # --- Shields ---
-    shields = list(base.shields)
+    # ------------------------------------------------------------------
+    # 4. Shields — advisory + Wiki specs
+    # ------------------------------------------------------------------
+    shields: list[str] = [comp_recs["shields"]]
     shield_hps = hardpoints.get("shields") or []
     if shield_hps:
         if _has_detail(shield_hps):
             specs = [_comp_spec(hp) for hp in shield_hps[:2] if _comp_spec(hp)]
             if specs:
-                shields.append("Wiki shield(s): " + ", ".join(specs))
+                shields.append("Installed: " + ", ".join(specs))
             else:
-                shields.append(f"Wiki: {len(shield_hps)} shield slot(s) detected")
+                shields.append(f"{len(shield_hps)} shield slot(s) detected")
         else:
-            shields.append(f"Wiki: {len(shield_hps)} shield slot(s) detected")
-    if performance.get("shield_hp"):
-        shields.append(f"Wiki shield HP: {performance['shield_hp']:,}")
+            shields.append(f"{len(shield_hps)} shield slot(s) detected")
 
-    # --- Power ---
-    power = list(base.power)
+    # ------------------------------------------------------------------
+    # 5. Power — advisory + Wiki specs
+    # ------------------------------------------------------------------
+    power: list[str] = [comp_recs["power"]]
     power_hps = hardpoints.get("power") or []
     if power_hps:
         if _has_detail(power_hps):
             specs = [_comp_spec(hp) for hp in power_hps[:2] if _comp_spec(hp)]
             if specs:
-                power.append("Wiki power plant: " + ", ".join(specs))
+                power.append("Installed: " + ", ".join(specs))
             else:
-                power.append(f"Wiki: {len(power_hps)} power slot(s) detected")
+                power.append(f"{len(power_hps)} power slot(s) detected")
         else:
-            power.append(f"Wiki: {len(power_hps)} power slot(s) detected")
+            power.append(f"{len(power_hps)} power slot(s) detected")
 
-    # --- Coolers ---
-    coolers = list(base.coolers)
+    # ------------------------------------------------------------------
+    # 6. Coolers — advisory + Wiki specs
+    # ------------------------------------------------------------------
+    coolers: list[str] = [comp_recs["coolers"]]
     cooler_hps = hardpoints.get("coolers") or []
     if cooler_hps:
         if _has_detail(cooler_hps):
             specs = [_comp_spec(hp) for hp in cooler_hps[:2] if _comp_spec(hp)]
             if specs:
-                coolers.append("Wiki cooler(s): " + ", ".join(specs))
+                coolers.append("Installed: " + ", ".join(specs))
             else:
-                coolers.append(f"Wiki: {len(cooler_hps)} cooler slot(s) detected")
+                coolers.append(f"{len(cooler_hps)} cooler slot(s) detected")
         else:
-            coolers.append(f"Wiki: {len(cooler_hps)} cooler slot(s) detected")
+            coolers.append(f"{len(cooler_hps)} cooler slot(s) detected")
 
-    # --- Notes / performance stats ---
-    notes = list(base.notes)
+    # ------------------------------------------------------------------
+    # 7. Notes — performance metrics summary
+    # ------------------------------------------------------------------
+    notes: list[str] = []
     perf_lines: list[str] = []
     if performance.get("scm_speed"):
-        perf_lines.append(f"SCM speed {performance['scm_speed']} m/s")
+        perf_lines.append(f"SCM {performance['scm_speed']} m/s")
     if performance.get("max_speed"):
-        perf_lines.append(f"max speed {performance['max_speed']} m/s")
+        perf_lines.append(f"max {performance['max_speed']} m/s")
     if performance.get("hull_hp"):
-        perf_lines.append(f"hull HP {performance['hull_hp']:,}")
+        perf_lines.append(f"hull {performance['hull_hp']:,} HP")
     if performance.get("cargo_scu"):
         perf_lines.append(f"cargo {performance['cargo_scu']} SCU")
     if performance.get("max_crew"):
-        perf_lines.append(f"max crew {performance['max_crew']}")
+        perf_lines.append(f"crew {performance['max_crew']}")
     if perf_lines:
-        notes.append(f"Wiki performance data — {', '.join(perf_lines)}.")
-    notes.append(f"Hardpoint data sourced from Star Citizen Wiki API ({wiki_ship_name}).")
+        notes.append(f"Performance — {', '.join(perf_lines)}.")
+    notes.append(f"Classified as **{ship_type}** based on Wiki stats ({wiki_ship_name}).")
 
     return LoadoutSuggestion(
         ship_name=base.ship_name,
-        role=base.role,
+        role=role,
         weapons=weapons,
         shields=shields,
         power=power,
