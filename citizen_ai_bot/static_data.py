@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
@@ -257,35 +258,76 @@ def _enrich_loadout(
     The curated text is preserved; Wiki data is appended as additional
     context so users see both the opinionated guidance *and* the real
     hardpoint/performance numbers from the API.
+
+    When detailed component data is available (weapon sizes, component names,
+    classes, and manufacturers) it is formatted into human-readable lines.
+    When only count data is available the output falls back to simple counts.
     """
     hardpoints: dict = wiki_data.get("hardpoints") or {}
     performance: dict = wiki_data.get("performance") or {}
     wiki_ship_name: str = wiki_data.get("ship_name") or base.ship_name
 
+    # ------------------------------------------------------------------
+    # Helper: build a compact spec string for a single component entry
+    # ------------------------------------------------------------------
+    def _comp_spec(hp: dict) -> str:
+        """Return a short human-readable spec string for one hardpoint entry."""
+        parts: list[str] = []
+        if hp.get("size"):
+            parts.append(f"Size {hp['size']}")
+        if hp.get("component_class"):
+            parts.append(f"Class {hp['component_class']}")
+        if hp.get("component_name"):
+            parts.append(hp["component_name"])
+        if hp.get("manufacturer"):
+            parts.append(f"({hp['manufacturer']})")
+        return " ".join(parts) if parts else ""
+
+    def _has_detail(hps: list[dict]) -> bool:
+        return any(hp.get("size") or hp.get("component_name") or hp.get("component_class") for hp in hps)
+
     # --- Weapons ---
     weapons = list(base.weapons)
     weapon_hps = hardpoints.get("weapons") or []
     if weapon_hps:
-        sizes = [str(hp["size"]) for hp in weapon_hps if hp.get("size")]
-        names = [hp["component_name"] for hp in weapon_hps if hp.get("component_name")]
-        if names:
-            weapons.append(f"Wiki hardpoints: {', '.join(names[:4])}" + (" …" if len(names) > 4 else ""))
-        elif sizes:
-            weapons.append(f"Wiki: {len(weapon_hps)} weapon slot(s), sizes {', '.join(sorted(set(sizes)))}")
+        if _has_detail(weapon_hps):
+            # Group by size so we can show e.g. "4× Size 3 laser repeater"
+            spec_counts: Counter = Counter(_comp_spec(hp) for hp in weapon_hps if _comp_spec(hp))
+            if spec_counts:
+                lines = [f"{cnt}× {spec}" if cnt > 1 else spec for spec, cnt in spec_counts.most_common(6)]
+                weapons.append("Wiki weapons: " + ", ".join(lines) + (" …" if len(spec_counts) > 6 else ""))
+            else:
+                # Has detail fields but all empty — show sizes if present
+                sizes = sorted({str(hp["size"]) for hp in weapon_hps if hp.get("size")})
+                if sizes:
+                    weapons.append(f"Wiki: {len(weapon_hps)} weapon slot(s) — sizes {', '.join(sizes)}")
+                else:
+                    weapons.append(f"Wiki: {len(weapon_hps)} weapon hardpoint(s) detected")
         else:
             weapons.append(f"Wiki: {len(weapon_hps)} weapon hardpoint(s) detected")
 
     missile_hps = hardpoints.get("missiles") or []
     if missile_hps:
-        weapons.append(f"Wiki: {len(missile_hps)} missile hardpoint(s) detected")
+        if _has_detail(missile_hps):
+            spec_counts: Counter = Counter(_comp_spec(hp) for hp in missile_hps if _comp_spec(hp))
+            if spec_counts:
+                lines = [f"{cnt}× {spec}" if cnt > 1 else spec for spec, cnt in spec_counts.most_common(4)]
+                weapons.append("Wiki missiles: " + ", ".join(lines))
+            else:
+                weapons.append(f"Wiki: {len(missile_hps)} missile hardpoint(s) detected")
+        else:
+            weapons.append(f"Wiki: {len(missile_hps)} missile hardpoint(s) detected")
 
     # --- Shields ---
     shields = list(base.shields)
     shield_hps = hardpoints.get("shields") or []
     if shield_hps:
-        names = [hp["component_name"] for hp in shield_hps if hp.get("component_name")]
-        if names:
-            shields.append(f"Wiki shields: {', '.join(names[:2])}")
+        if _has_detail(shield_hps):
+            specs = [_comp_spec(hp) for hp in shield_hps[:2] if _comp_spec(hp)]
+            if specs:
+                shields.append("Wiki shield(s): " + ", ".join(specs))
+            else:
+                shields.append(f"Wiki: {len(shield_hps)} shield slot(s) detected")
         else:
             shields.append(f"Wiki: {len(shield_hps)} shield slot(s) detected")
     if performance.get("shield_hp"):
@@ -295,9 +337,12 @@ def _enrich_loadout(
     power = list(base.power)
     power_hps = hardpoints.get("power") or []
     if power_hps:
-        names = [hp["component_name"] for hp in power_hps if hp.get("component_name")]
-        if names:
-            power.append(f"Wiki power plant: {', '.join(names[:2])}")
+        if _has_detail(power_hps):
+            specs = [_comp_spec(hp) for hp in power_hps[:2] if _comp_spec(hp)]
+            if specs:
+                power.append("Wiki power plant: " + ", ".join(specs))
+            else:
+                power.append(f"Wiki: {len(power_hps)} power slot(s) detected")
         else:
             power.append(f"Wiki: {len(power_hps)} power slot(s) detected")
 
@@ -305,9 +350,12 @@ def _enrich_loadout(
     coolers = list(base.coolers)
     cooler_hps = hardpoints.get("coolers") or []
     if cooler_hps:
-        names = [hp["component_name"] for hp in cooler_hps if hp.get("component_name")]
-        if names:
-            coolers.append(f"Wiki coolers: {', '.join(names[:2])}")
+        if _has_detail(cooler_hps):
+            specs = [_comp_spec(hp) for hp in cooler_hps[:2] if _comp_spec(hp)]
+            if specs:
+                coolers.append("Wiki cooler(s): " + ", ".join(specs))
+            else:
+                coolers.append(f"Wiki: {len(cooler_hps)} cooler slot(s) detected")
         else:
             coolers.append(f"Wiki: {len(cooler_hps)} cooler slot(s) detected")
 
@@ -337,6 +385,7 @@ def _enrich_loadout(
         coolers=coolers,
         notes=notes,
     )
+
 
 
 def _build_dynamic_loadout(ship_name: str) -> LoadoutSuggestion:

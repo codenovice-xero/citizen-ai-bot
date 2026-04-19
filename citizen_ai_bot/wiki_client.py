@@ -54,12 +54,14 @@ class WikiClient:
 
         The Star Citizen Wiki API exposes individual vehicle records at
         ``/vehicles/{ship_name}`` where the ship name is passed as a URL path
-        parameter.  Returns the ship dict directly, or ``None`` if the ship is
-        not found or the API fails.
+        parameter.  The ``include=components`` query parameter is added to
+        request detailed hardpoint/component data when available.  Returns the
+        ship dict directly, or ``None`` if the ship is not found or the API
+        fails.
         """
         endpoint = f"/vehicles/{ship_name}"
         try:
-            response = await self._http.get(endpoint)
+            response = await self._http.get(endpoint, params={"include": "components"})
             response.raise_for_status()
 
             content_type = response.headers.get("content-type", "")
@@ -90,6 +92,11 @@ class WikiClient:
             if not ship_data:
                 log.debug("Star Citizen Wiki: no results for ship %r", ship_name)
                 return None
+            log.debug(
+                "Star Citizen Wiki: top-level keys for %r: %s",
+                ship_name,
+                list(ship_data.keys()) if isinstance(ship_data, dict) else type(ship_data).__name__,
+            )
             return ship_data
 
         log.warning(
@@ -99,14 +106,25 @@ class WikiClient:
         )
         return None
 
+
+
     @staticmethod
     def _extract_hardpoints(ship_data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         """Parse raw Wiki ship data into categorised hardpoint buckets.
 
-        The Wiki API does not expose individual hardpoint specs; instead it
-        provides summary counts in ``weapon_snapshot``.  This method converts
-        those counts into simple bucket entries so the rest of the codebase
-        can consume them uniformly.
+        When the API returns detailed component data (via ``include=components``)
+        the ``components`` key will contain a list of hardpoint records.  Each
+        record is parsed to extract weapon sizes, component names, classes, and
+        manufacturer info.  If no detailed component data is present the method
+        falls back to the ``weapon_snapshot`` summary counts so the rest of the
+        codebase always receives a consistent structure.
+
+        Each bucket entry is a dict that may contain:
+        - ``count`` (int): always 1 per entry
+        - ``size`` (str | None): e.g. ``"3"`` or ``"S3"``
+        - ``component_name`` (str | None): display name of the equipped item
+        - ``component_class`` (str | None): e.g. ``"A"``, ``"B"``
+        - ``manufacturer`` (str | None): manufacturer name
 
         Returns a dict with keys: ``weapons``, ``shields``, ``power``,
         ``coolers``, ``missiles``, ``other``.
@@ -120,6 +138,66 @@ class WikiClient:
             "other": [],
         }
 
+        # ------------------------------------------------------------------
+        # Attempt to parse detailed component data from include=components
+        # ------------------------------------------------------------------
+        components: list[Any] = ship_data.get("components") or []
+        if components and isinstance(components, list):
+            for comp in components:
+                if not isinstance(comp, dict):
+                    continue
+
+                # Determine the hardpoint category from the component type/sub_type
+                comp_type: str = str(comp.get("type") or comp.get("sub_type") or "").lower()
+                comp_name: str | None = comp.get("name") or comp.get("component_name") or None
+                comp_class: str | None = comp.get("class") or comp.get("item_class") or None
+                comp_size_raw = comp.get("size") or comp.get("item_size") or None
+                comp_size: str | None = str(comp_size_raw) if comp_size_raw is not None else None
+                manufacturer: str | None = (
+                    comp.get("manufacturer")
+                    or (comp.get("manufacturer_data") or {}).get("name")
+                    or None
+                )
+
+                entry: dict[str, Any] = {
+                    "count": 1,
+                    "size": comp_size,
+                    "component_name": comp_name,
+                    "component_class": comp_class,
+                    "manufacturer": manufacturer,
+                }
+
+                if any(kw in comp_type for kw in ("weapon", "gun", "laser", "cannon", "repeater", "ballistic")):
+                    buckets["weapons"].append(entry)
+                elif any(kw in comp_type for kw in ("missile", "torpedo", "rack")):
+                    buckets["missiles"].append(entry)
+                elif any(kw in comp_type for kw in ("shield",)):
+                    buckets["shields"].append(entry)
+                elif any(kw in comp_type for kw in ("power", "powerplant", "power_plant")):
+                    buckets["power"].append(entry)
+                elif any(kw in comp_type for kw in ("cooler",)):
+                    buckets["coolers"].append(entry)
+                else:
+                    buckets["other"].append(entry)
+
+            # If we successfully parsed at least one component, return early.
+            # Fill in any empty shield/power/cooler slots from snapshot data so
+            # the display is never completely blank for those categories.
+            if any(buckets[k] for k in ("weapons", "missiles", "shields", "power", "coolers")):
+                if not buckets["shields"] and ship_data.get("shield_hp"):
+                    buckets["shields"].append({"count": 1, "size": None, "component_name": None,
+                                               "component_class": None, "manufacturer": None})
+                if not buckets["power"]:
+                    buckets["power"].append({"count": 1, "size": None, "component_name": None,
+                                             "component_class": None, "manufacturer": None})
+                if not buckets["coolers"]:
+                    buckets["coolers"].append({"count": 1, "size": None, "component_name": None,
+                                               "component_class": None, "manufacturer": None})
+                return buckets
+
+        # ------------------------------------------------------------------
+        # Fallback: use weapon_snapshot summary counts
+        # ------------------------------------------------------------------
         snapshot: dict[str, Any] = ship_data.get("weapon_snapshot") or {}
 
         # Weapons: pilot guns + turret guns
@@ -127,22 +205,29 @@ class WikiClient:
         turret_guns: int = int(snapshot.get("turret_weapon_guns_count") or 0)
         total_weapons = pilot_guns + turret_guns
         for _ in range(total_weapons):
-            buckets["weapons"].append({"count": 1})
+            buckets["weapons"].append({"count": 1, "size": None, "component_name": None,
+                                       "component_class": None, "manufacturer": None})
 
         # Missiles: prefer rack count, fall back to individual missile count
         missile_racks: int = int(snapshot.get("missile_rack_count") or snapshot.get("missile_count") or 0)
         for _ in range(missile_racks):
-            buckets["missiles"].append({"count": 1})
+            buckets["missiles"].append({"count": 1, "size": None, "component_name": None,
+                                        "component_class": None, "manufacturer": None})
 
         # Shields: 1 slot if the ship has shield HP data
         if ship_data.get("shield_hp"):
-            buckets["shields"].append({"count": 1})
+            buckets["shields"].append({"count": 1, "size": None, "component_name": None,
+                                       "component_class": None, "manufacturer": None})
 
         # Power and coolers: assume one of each for any ship
-        buckets["power"].append({"count": 1})
-        buckets["coolers"].append({"count": 1})
+        buckets["power"].append({"count": 1, "size": None, "component_name": None,
+                                 "component_class": None, "manufacturer": None})
+        buckets["coolers"].append({"count": 1, "size": None, "component_name": None,
+                                   "component_class": None, "manufacturer": None})
 
         return buckets
+
+
 
     @staticmethod
     def _extract_performance(ship_data: dict[str, Any]) -> dict[str, Any]:
