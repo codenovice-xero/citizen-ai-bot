@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from .models import AdvicePlan, LoadoutSuggestion, MiningSuggestion
 
 if TYPE_CHECKING:
-    from .erkul_client import ErkulClient
+    from .wiki_client import WikiClient
 
 log = logging.getLogger(__name__)
 
@@ -193,7 +193,7 @@ def get_loadout_suggestion(
     3. Dynamic fallback built from the ship name.
 
     If *erkul_enrichment* is provided (a dict returned by
-    :func:`get_erkul_loadout`) the resulting suggestion is enriched with
+    :func:`get_wiki_loadout`) the resulting suggestion is enriched with
     real hardpoint counts and performance stats before being returned.
     """
     requested_ship = (requested_ship or "").strip()
@@ -212,17 +212,17 @@ def get_loadout_suggestion(
     return _enrich_loadout(base, erkul_enrichment) if erkul_enrichment else base
 
 
-async def get_erkul_loadout(
+async def get_wiki_loadout(
     ship_name: str,
-    erkul: "ErkulClient",
+    wiki: "WikiClient",
 ) -> dict | None:
-    """Query erkul.games for *ship_name* and return an enrichment dict.
+    """Query the Star Citizen Wiki API for *ship_name* and return an enrichment dict.
 
     The returned dict contains:
     - ``hardpoints``: categorised hardpoint buckets from
-      :meth:`ErkulClient.get_hardpoints`
+      :meth:`WikiClient.get_hardpoints`
     - ``performance``: flat performance metrics from
-      :meth:`ErkulClient.get_performance`
+      :meth:`WikiClient.get_performance`
     - ``ship_name``: the normalised name as returned by the API
 
     Returns ``None`` if the ship is not found or the API is unavailable,
@@ -231,36 +231,36 @@ async def get_erkul_loadout(
     if not ship_name:
         return None
     try:
-        ship_data = await erkul.get_ship(ship_name)
+        ship_data = await wiki.get_ship(ship_name)
         if ship_data is None:
             return None
 
-        hardpoints = erkul._extract_hardpoints(ship_data)
-        performance = erkul._extract_performance(ship_data)
+        hardpoints = wiki._extract_hardpoints(ship_data)
+        performance = wiki._extract_performance(ship_data)
 
         return {
-            "ship_name": str(ship_data.get("name") or ship_data.get("shipName") or ship_name),
+            "ship_name": str(ship_data.get("name") or ship_name),
             "hardpoints": hardpoints,
             "performance": performance,
         }
     except Exception as exc:
-        log.warning("get_erkul_loadout failed for %r: %s", ship_name, exc)
+        log.warning("get_wiki_loadout failed for %r: %s", ship_name, exc)
         return None
 
 
 def _enrich_loadout(
     base: LoadoutSuggestion,
-    erkul_data: dict,
+    wiki_data: dict,
 ) -> LoadoutSuggestion:
-    """Return a new :class:`LoadoutSuggestion` enriched with erkul.games data.
+    """Return a new :class:`LoadoutSuggestion` enriched with Star Citizen Wiki API data.
 
-    The curated text is preserved; erkul data is appended as additional
+    The curated text is preserved; Wiki data is appended as additional
     context so users see both the opinionated guidance *and* the real
     hardpoint/performance numbers from the API.
     """
-    hardpoints: dict = erkul_data.get("hardpoints") or {}
-    performance: dict = erkul_data.get("performance") or {}
-    erkul_ship_name: str = erkul_data.get("ship_name") or base.ship_name
+    hardpoints: dict = wiki_data.get("hardpoints") or {}
+    performance: dict = wiki_data.get("performance") or {}
+    wiki_ship_name: str = wiki_data.get("ship_name") or base.ship_name
 
     # --- Weapons ---
     weapons = list(base.weapons)
@@ -269,15 +269,15 @@ def _enrich_loadout(
         sizes = [str(hp["size"]) for hp in weapon_hps if hp.get("size")]
         names = [hp["component_name"] for hp in weapon_hps if hp.get("component_name")]
         if names:
-            weapons.append(f"Erkul hardpoints: {', '.join(names[:4])}" + (" …" if len(names) > 4 else ""))
+            weapons.append(f"Wiki hardpoints: {', '.join(names[:4])}" + (" …" if len(names) > 4 else ""))
         elif sizes:
-            weapons.append(f"Erkul: {len(weapon_hps)} weapon slot(s), sizes {', '.join(sorted(set(sizes)))}")
+            weapons.append(f"Wiki: {len(weapon_hps)} weapon slot(s), sizes {', '.join(sorted(set(sizes)))}")
         else:
-            weapons.append(f"Erkul: {len(weapon_hps)} weapon hardpoint(s) detected")
+            weapons.append(f"Wiki: {len(weapon_hps)} weapon hardpoint(s) detected")
 
     missile_hps = hardpoints.get("missiles") or []
     if missile_hps:
-        weapons.append(f"Erkul: {len(missile_hps)} missile hardpoint(s) detected")
+        weapons.append(f"Wiki: {len(missile_hps)} missile hardpoint(s) detected")
 
     # --- Shields ---
     shields = list(base.shields)
@@ -285,11 +285,11 @@ def _enrich_loadout(
     if shield_hps:
         names = [hp["component_name"] for hp in shield_hps if hp.get("component_name")]
         if names:
-            shields.append(f"Erkul shields: {', '.join(names[:2])}")
+            shields.append(f"Wiki shields: {', '.join(names[:2])}")
         else:
-            shields.append(f"Erkul: {len(shield_hps)} shield slot(s) detected")
+            shields.append(f"Wiki: {len(shield_hps)} shield slot(s) detected")
     if performance.get("shield_hp"):
-        shields.append(f"Erkul shield HP: {performance['shield_hp']:,}")
+        shields.append(f"Wiki shield HP: {performance['shield_hp']:,}")
 
     # --- Power ---
     power = list(base.power)
@@ -297,9 +297,9 @@ def _enrich_loadout(
     if power_hps:
         names = [hp["component_name"] for hp in power_hps if hp.get("component_name")]
         if names:
-            power.append(f"Erkul power plant: {', '.join(names[:2])}")
+            power.append(f"Wiki power plant: {', '.join(names[:2])}")
         else:
-            power.append(f"Erkul: {len(power_hps)} power slot(s) detected")
+            power.append(f"Wiki: {len(power_hps)} power slot(s) detected")
 
     # --- Coolers ---
     coolers = list(base.coolers)
@@ -307,9 +307,9 @@ def _enrich_loadout(
     if cooler_hps:
         names = [hp["component_name"] for hp in cooler_hps if hp.get("component_name")]
         if names:
-            coolers.append(f"Erkul coolers: {', '.join(names[:2])}")
+            coolers.append(f"Wiki coolers: {', '.join(names[:2])}")
         else:
-            coolers.append(f"Erkul: {len(cooler_hps)} cooler slot(s) detected")
+            coolers.append(f"Wiki: {len(cooler_hps)} cooler slot(s) detected")
 
     # --- Notes / performance stats ---
     notes = list(base.notes)
@@ -325,8 +325,8 @@ def _enrich_loadout(
     if performance.get("max_crew"):
         perf_lines.append(f"max crew {performance['max_crew']}")
     if perf_lines:
-        notes.append(f"Erkul performance data — {', '.join(perf_lines)}.")
-    notes.append(f"Hardpoint data sourced from erkul.games ({erkul_ship_name}).")
+        notes.append(f"Wiki performance data — {', '.join(perf_lines)}.")
+    notes.append(f"Hardpoint data sourced from Star Citizen Wiki API ({wiki_ship_name}).")
 
     return LoadoutSuggestion(
         ship_name=base.ship_name,
