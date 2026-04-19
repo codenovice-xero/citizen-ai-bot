@@ -182,7 +182,7 @@ MISSION_GUIDE: dict[str, list[str]] = {
 
 def get_loadout_suggestion(
     requested_ship: str,
-    erkul_enrichment: dict | None = None,
+    wiki_enrichment: dict | None = None,
 ) -> LoadoutSuggestion | None:
     """Return a :class:`LoadoutSuggestion` for *requested_ship*.
 
@@ -192,7 +192,7 @@ def get_loadout_suggestion(
     2. Fuzzy match in ``CURATED_LOADOUTS`` (similarity ≥ 0.82).
     3. Dynamic fallback built from the ship name.
 
-    If *erkul_enrichment* is provided (a dict returned by
+    If *wiki_enrichment* is provided (a dict returned by
     :func:`get_wiki_loadout`) the resulting suggestion is enriched with
     real hardpoint counts and performance stats before being returned.
     """
@@ -202,14 +202,14 @@ def get_loadout_suggestion(
 
     exact = next((item for item in CURATED_LOADOUTS if _norm(item.ship_name) == _norm(requested_ship)), None)
     if exact:
-        return _enrich_loadout(exact, erkul_enrichment) if erkul_enrichment else exact
+        return _enrich_loadout(exact, wiki_enrichment) if wiki_enrichment else exact
 
     best = max(CURATED_LOADOUTS, key=lambda item: _similarity(item.ship_name, requested_ship), default=None)
     if best and _similarity(best.ship_name, requested_ship) >= 0.82:
-        return _enrich_loadout(best, erkul_enrichment) if erkul_enrichment else best
+        return _enrich_loadout(best, wiki_enrichment) if wiki_enrichment else best
 
     base = _build_dynamic_loadout(requested_ship)
-    return _enrich_loadout(base, erkul_enrichment) if erkul_enrichment else base
+    return _enrich_loadout(base, wiki_enrichment) if wiki_enrichment else base
 
 
 async def get_wiki_loadout(

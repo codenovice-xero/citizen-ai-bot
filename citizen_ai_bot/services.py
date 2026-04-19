@@ -291,7 +291,7 @@ class StarCitizenService:
         unavailable.
         """
         wiki_data = await get_wiki_loadout(ship_name, self.wiki)
-        return get_loadout_suggestion(ship_name, erkul_enrichment=wiki_data)
+        return get_loadout_suggestion(ship_name, wiki_enrichment=wiki_data)
 
     def suggest_mining(self, ship_name: str) -> MiningSuggestion | None:
         return get_mining_suggestion(ship_name)
