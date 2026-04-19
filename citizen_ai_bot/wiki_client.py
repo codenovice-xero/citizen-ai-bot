@@ -77,6 +77,7 @@ class WikiClient:
                 return None
 
             payload = response.json()
+            print(f"DEBUG: Wiki API response for {ship_name}: {str(payload)[:3000]}")
             log.warning(
                 "Star Citizen Wiki raw response for %r: %.2000s",
                 ship_name,
