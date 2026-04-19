@@ -33,7 +33,7 @@ class CitizenAIBot(commands.Bot):
             await self.sc_service.client.close()
         finally:
             try:
-                await self.sc_service.erkul.close()
+                await self.sc_service.wiki.close()
             finally:
                 await super().close()
 
