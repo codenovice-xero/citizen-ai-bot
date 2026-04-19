@@ -32,7 +32,10 @@ class CitizenAIBot(commands.Bot):
         try:
             await self.sc_service.client.close()
         finally:
-            await super().close()
+            try:
+                await self.sc_service.erkul.close()
+            finally:
+                await super().close()
 
     async def on_ready(self) -> None:
         log.info("Bot connected as %s", self.user)

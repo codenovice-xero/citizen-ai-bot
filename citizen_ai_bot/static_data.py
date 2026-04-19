@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import logging
 from difflib import SequenceMatcher
+from typing import TYPE_CHECKING
 
 from .models import AdvicePlan, LoadoutSuggestion, MiningSuggestion
+
+if TYPE_CHECKING:
+    from .erkul_client import ErkulClient
+
+log = logging.getLogger(__name__)
 
 
 def _norm(value: str) -> str:
@@ -173,20 +180,163 @@ MISSION_GUIDE: dict[str, list[str]] = {
 }
 
 
-def get_loadout_suggestion(requested_ship: str) -> LoadoutSuggestion | None:
+def get_loadout_suggestion(
+    requested_ship: str,
+    erkul_enrichment: dict | None = None,
+) -> LoadoutSuggestion | None:
+    """Return a :class:`LoadoutSuggestion` for *requested_ship*.
+
+    Resolution order:
+    1. Exact match in ``CURATED_LOADOUTS`` (always wins — curated data is
+       intentionally opinionated).
+    2. Fuzzy match in ``CURATED_LOADOUTS`` (similarity ≥ 0.82).
+    3. Dynamic fallback built from the ship name.
+
+    If *erkul_enrichment* is provided (a dict returned by
+    :func:`get_erkul_loadout`) the resulting suggestion is enriched with
+    real hardpoint counts and performance stats before being returned.
+    """
     requested_ship = (requested_ship or "").strip()
     if not requested_ship:
         return None
 
     exact = next((item for item in CURATED_LOADOUTS if _norm(item.ship_name) == _norm(requested_ship)), None)
     if exact:
-        return exact
+        return _enrich_loadout(exact, erkul_enrichment) if erkul_enrichment else exact
 
     best = max(CURATED_LOADOUTS, key=lambda item: _similarity(item.ship_name, requested_ship), default=None)
     if best and _similarity(best.ship_name, requested_ship) >= 0.82:
-        return best
+        return _enrich_loadout(best, erkul_enrichment) if erkul_enrichment else best
 
-    return _build_dynamic_loadout(requested_ship)
+    base = _build_dynamic_loadout(requested_ship)
+    return _enrich_loadout(base, erkul_enrichment) if erkul_enrichment else base
+
+
+async def get_erkul_loadout(
+    ship_name: str,
+    erkul: "ErkulClient",
+) -> dict | None:
+    """Query erkul.games for *ship_name* and return an enrichment dict.
+
+    The returned dict contains:
+    - ``hardpoints``: categorised hardpoint buckets from
+      :meth:`ErkulClient.get_hardpoints`
+    - ``performance``: flat performance metrics from
+      :meth:`ErkulClient.get_performance`
+    - ``ship_name``: the normalised name as returned by the API
+
+    Returns ``None`` if the ship is not found or the API is unavailable,
+    so callers can fall back to curated data transparently.
+    """
+    if not ship_name:
+        return None
+    try:
+        ship_data = await erkul.get_ship(ship_name)
+        if ship_data is None:
+            return None
+
+        hardpoints = erkul._extract_hardpoints(ship_data)
+        performance = erkul._extract_performance(ship_data)
+
+        return {
+            "ship_name": str(ship_data.get("name") or ship_data.get("shipName") or ship_name),
+            "hardpoints": hardpoints,
+            "performance": performance,
+        }
+    except Exception as exc:
+        log.warning("get_erkul_loadout failed for %r: %s", ship_name, exc)
+        return None
+
+
+def _enrich_loadout(
+    base: LoadoutSuggestion,
+    erkul_data: dict,
+) -> LoadoutSuggestion:
+    """Return a new :class:`LoadoutSuggestion` enriched with erkul.games data.
+
+    The curated text is preserved; erkul data is appended as additional
+    context so users see both the opinionated guidance *and* the real
+    hardpoint/performance numbers from the API.
+    """
+    hardpoints: dict = erkul_data.get("hardpoints") or {}
+    performance: dict = erkul_data.get("performance") or {}
+    erkul_ship_name: str = erkul_data.get("ship_name") or base.ship_name
+
+    # --- Weapons ---
+    weapons = list(base.weapons)
+    weapon_hps = hardpoints.get("weapons") or []
+    if weapon_hps:
+        sizes = [str(hp["size"]) for hp in weapon_hps if hp.get("size")]
+        names = [hp["component_name"] for hp in weapon_hps if hp.get("component_name")]
+        if names:
+            weapons.append(f"Erkul hardpoints: {', '.join(names[:4])}" + (" …" if len(names) > 4 else ""))
+        elif sizes:
+            weapons.append(f"Erkul: {len(weapon_hps)} weapon slot(s), sizes {', '.join(sorted(set(sizes)))}")
+        else:
+            weapons.append(f"Erkul: {len(weapon_hps)} weapon hardpoint(s) detected")
+
+    missile_hps = hardpoints.get("missiles") or []
+    if missile_hps:
+        weapons.append(f"Erkul: {len(missile_hps)} missile hardpoint(s) detected")
+
+    # --- Shields ---
+    shields = list(base.shields)
+    shield_hps = hardpoints.get("shields") or []
+    if shield_hps:
+        names = [hp["component_name"] for hp in shield_hps if hp.get("component_name")]
+        if names:
+            shields.append(f"Erkul shields: {', '.join(names[:2])}")
+        else:
+            shields.append(f"Erkul: {len(shield_hps)} shield slot(s) detected")
+    if performance.get("shield_hp"):
+        shields.append(f"Erkul shield HP: {performance['shield_hp']:,}")
+
+    # --- Power ---
+    power = list(base.power)
+    power_hps = hardpoints.get("power") or []
+    if power_hps:
+        names = [hp["component_name"] for hp in power_hps if hp.get("component_name")]
+        if names:
+            power.append(f"Erkul power plant: {', '.join(names[:2])}")
+        else:
+            power.append(f"Erkul: {len(power_hps)} power slot(s) detected")
+
+    # --- Coolers ---
+    coolers = list(base.coolers)
+    cooler_hps = hardpoints.get("coolers") or []
+    if cooler_hps:
+        names = [hp["component_name"] for hp in cooler_hps if hp.get("component_name")]
+        if names:
+            coolers.append(f"Erkul coolers: {', '.join(names[:2])}")
+        else:
+            coolers.append(f"Erkul: {len(cooler_hps)} cooler slot(s) detected")
+
+    # --- Notes / performance stats ---
+    notes = list(base.notes)
+    perf_lines: list[str] = []
+    if performance.get("scm_speed"):
+        perf_lines.append(f"SCM speed {performance['scm_speed']} m/s")
+    if performance.get("max_speed"):
+        perf_lines.append(f"max speed {performance['max_speed']} m/s")
+    if performance.get("hull_hp"):
+        perf_lines.append(f"hull HP {performance['hull_hp']:,}")
+    if performance.get("cargo_scu"):
+        perf_lines.append(f"cargo {performance['cargo_scu']} SCU")
+    if performance.get("max_crew"):
+        perf_lines.append(f"max crew {performance['max_crew']}")
+    if perf_lines:
+        notes.append(f"Erkul performance data — {', '.join(perf_lines)}.")
+    notes.append(f"Hardpoint data sourced from erkul.games ({erkul_ship_name}).")
+
+    return LoadoutSuggestion(
+        ship_name=base.ship_name,
+        role=base.role,
+        weapons=weapons,
+        shields=shields,
+        power=power,
+        coolers=coolers,
+        notes=notes,
+    )
 
 
 def _build_dynamic_loadout(ship_name: str) -> LoadoutSuggestion:
