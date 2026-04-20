@@ -124,8 +124,11 @@ class WikiClient:
         - ``size`` (str | None): e.g. ``"3"`` or ``"S3"``
         - ``component_name`` (str | None): display name of the equipped item
         - ``component_class`` (str | None): e.g. ``"A"``, ``"B"``
-        - ``component_type`` (str | None): raw ``type`` field from the API, e.g.
-          ``"ballistic_cannon"``, ``"laser_repeater"``, ``"weapon_gun"``
+        - ``component_type`` (str | None): specific weapon/component type resolved
+          from the API, e.g. ``"ballistic_cannon"``, ``"laser_repeater"``.
+          When the top-level ``type`` field is an aggregated category
+          (``"weapons"``, ``"missiles"``, ``"shield_generators"``) this is
+          resolved from nested ``details``, ``specs``, or ``sub_type`` fields.
         - ``class_name`` (str | None): internal class identifier, e.g. ``"GLSN_Shiv"``
         - ``manufacturer`` (str | None): manufacturer name
 
@@ -141,7 +144,42 @@ class WikiClient:
             "other": [],
         }
 
+        # ------------------------------------------------------------------
+        # Debug: log the full set of top-level keys in ship_data so we can
+        # identify every field the API returns, including any separate
+        # "weapons" array, "weapon_snapshot", or other spec containers.
+        # ------------------------------------------------------------------
+        log.debug(
+            "Wiki API ship_data top-level keys: %s",
+            list(ship_data.keys()) if isinstance(ship_data, dict) else type(ship_data).__name__,
+        )
 
+        # Log weapon_snapshot if present — it may contain detailed weapon info
+        # (e.g. individual weapon class names) beyond the summary counts.
+        snapshot_raw: dict[str, Any] = ship_data.get("weapon_snapshot") or {}
+        if snapshot_raw:
+            log.debug("Wiki API weapon_snapshot: %s", snapshot_raw)
+
+        # Log any top-level "weapons" array that is separate from "components"
+        # — the API may expose individual weapon specs here.
+        top_level_weapons: list[Any] = ship_data.get("weapons") or []
+        if top_level_weapons:
+            log.debug(
+                "Wiki API top-level 'weapons' array (%d entries): %s",
+                len(top_level_weapons),
+                top_level_weapons[:3],
+            )
+
+        # Log any other top-level arrays/dicts that look like they could hold
+        # component specifications (e.g. "hardpoints", "loadout", "items").
+        for _candidate_key in ("hardpoints", "loadout", "items", "equipment", "modules"):
+            _candidate_val = ship_data.get(_candidate_key)
+            if _candidate_val:
+                log.debug(
+                    "Wiki API candidate spec field %r: %s",
+                    _candidate_key,
+                    _candidate_val if not isinstance(_candidate_val, list) else _candidate_val[:2],
+                )
 
         # ------------------------------------------------------------------
         # Attempt to parse detailed component data from include=components
@@ -160,6 +198,16 @@ class WikiClient:
                     "Wiki API first component data: %s",
                     first_comp,
                 )
+                # Log any nested sub-dicts that might hold the specific type
+                # (e.g. "details", "specs", "item", "component").
+                for _nested_key in ("details", "specs", "item", "component", "sub_type", "weapon_data"):
+                    _nested_val = first_comp.get(_nested_key)
+                    if _nested_val is not None:
+                        log.debug(
+                            "Wiki API first component nested field %r: %s",
+                            _nested_key,
+                            _nested_val,
+                        )
 
             for comp in components:
                 if not isinstance(comp, dict):
@@ -169,13 +217,62 @@ class WikiClient:
                 # comp_type is used purely for bucket routing below.
                 comp_type: str = str(comp.get("type") or "").lower()
 
-                # The Wiki API returns the component type in the `type` field
-                # (e.g. "ballistic_cannon", "weapon_gun", "radar").  Store it
-                # as component_type so _clean_component_name() can use it.
+                # The Wiki API's top-level ``type`` field sometimes carries an
+                # aggregated category name (e.g. ``"weapons"``, ``"missiles"``,
+                # ``"shield_generators"``) rather than a specific weapon type.
+                # When that happens, try to resolve the specific type from
+                # nested fields in priority order:
+                #   1. ``sub_type``  — explicit sub-classification
+                #   2. ``details.type`` / ``specs.type`` — nested spec objects
+                #   3. ``item.type`` / ``component.type`` — linked item records
+                #   4. ``weapon_data.type`` — weapon-specific sub-object
+                #   5. ``class_name`` — internal identifier (e.g. "GLSN_Shiv")
+                #      which often encodes the weapon family
+                # Fall back to the raw top-level ``type`` only when nothing
+                # more specific is available.
+                _AGGREGATED_TYPES: frozenset[str] = frozenset({
+                    "weapons", "missiles", "shield_generators", "shields",
+                    "power_plants", "coolers", "turrets", "guns",
+                })
                 raw_type: str | None = comp.get("type") or None
-                component_type: str | None = (
-                    str(raw_type).strip() if raw_type else None
-                )
+                component_type: str | None = str(raw_type).strip() if raw_type else None
+
+                if component_type and component_type.lower() in _AGGREGATED_TYPES:
+                    # Top-level type is a generic category — dig for specifics.
+                    _resolved: str | None = None
+
+                    # 1. Explicit sub_type field
+                    _resolved = _resolved or (str(comp["sub_type"]).strip() if comp.get("sub_type") else None)
+
+                    # 2. Nested details / specs objects
+                    for _nk in ("details", "specs", "item", "component", "weapon_data"):
+                        _nested = comp.get(_nk)
+                        if isinstance(_nested, dict):
+                            _nt = _nested.get("type") or _nested.get("sub_type") or _nested.get("name")
+                            if _nt:
+                                _resolved = _resolved or str(_nt).strip()
+                                break
+
+                    # 3. class_name as a last-resort hint (e.g. "GLSN_Shiv" → keep raw)
+                    if not _resolved and comp.get("class_name"):
+                        _resolved = str(comp["class_name"]).strip()
+
+                    if _resolved:
+                        log.debug(
+                            "Wiki API: resolved specific type %r from aggregated %r (comp name=%r)",
+                            _resolved,
+                            component_type,
+                            comp.get("name"),
+                        )
+                        component_type = _resolved
+                    else:
+                        log.debug(
+                            "Wiki API: could not resolve specific type from aggregated %r "
+                            "(comp name=%r, keys=%s)",
+                            component_type,
+                            comp.get("name"),
+                            list(comp.keys()),
+                        )
 
                 comp_name: str | None = comp.get("name") or None
                 comp_class: str | None = comp.get("component_class") or None
@@ -197,7 +294,6 @@ class WikiClient:
                     "class_name": class_name,
                     "manufacturer": manufacturer,
                 }
-
 
                 if any(kw in comp_type for kw in ("weapon", "gun", "laser", "cannon", "repeater", "ballistic")):
                     buckets["weapons"].append(entry)
