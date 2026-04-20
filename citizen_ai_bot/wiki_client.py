@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any
@@ -125,7 +124,7 @@ class WikiClient:
         - ``size`` (str | None): e.g. ``"3"`` or ``"S3"``
         - ``component_name`` (str | None): display name of the equipped item
         - ``component_class`` (str | None): e.g. ``"A"``, ``"B"``
-        - ``component_type`` (str | None): raw type string from the API, e.g.
+        - ``component_type`` (str | None): raw ``type`` field from the API, e.g.
           ``"ballistic_cannon"``, ``"laser_repeater"``, ``"weapon_gun"``
         - ``class_name`` (str | None): internal class identifier, e.g. ``"GLSN_Shiv"``
         - ``manufacturer`` (str | None): manufacturer name
@@ -161,37 +160,26 @@ class WikiClient:
                     "Wiki API first component data: %s",
                     first_comp,
                 )
-                print(
-                    "[WikiClient] first component structure:\n"
-                    + json.dumps(first_comp, indent=2, default=str),
-                    flush=True,
-                )
 
             for comp in components:
                 if not isinstance(comp, dict):
                     continue
 
-                # Determine the hardpoint category from the component type/sub_type.
+                # Determine the hardpoint category from the component type.
                 # comp_type is used purely for bucket routing below.
-                comp_type: str = str(comp.get("type") or comp.get("sub_type") or "").lower()
+                comp_type: str = str(comp.get("type") or "").lower()
 
-                # Extract the most descriptive type label available.  The API
-                # may expose this under several different keys depending on the
-                # endpoint version; try them in order of specificity.
-                raw_item_type: str | None = (
-                    comp.get("item_type")
-                    or comp.get("component_type")
-                    or comp.get("sub_type")
-                    or comp.get("type")
-                    or None
-                )
+                # The Wiki API returns the component type in the `type` field
+                # (e.g. "ballistic_cannon", "weapon_gun", "radar").  Store it
+                # as component_type so _clean_component_name() can use it.
+                raw_type: str | None = comp.get("type") or None
                 component_type: str | None = (
-                    str(raw_item_type).strip() if raw_item_type else None
+                    str(raw_type).strip() if raw_type else None
                 )
 
-                comp_name: str | None = comp.get("name") or comp.get("component_name") or None
-                comp_class: str | None = comp.get("class") or comp.get("item_class") or None
-                comp_size_raw = comp.get("size") or comp.get("item_size") or None
+                comp_name: str | None = comp.get("name") or None
+                comp_class: str | None = comp.get("component_class") or None
+                comp_size_raw = comp.get("component_size") or comp.get("size") or None
                 comp_size: str | None = str(comp_size_raw) if comp_size_raw is not None else None
                 manufacturer: str | None = (
                     comp.get("manufacturer")
