@@ -124,6 +124,9 @@ class WikiClient:
         - ``size`` (str | None): e.g. ``"3"`` or ``"S3"``
         - ``component_name`` (str | None): display name of the equipped item
         - ``component_class`` (str | None): e.g. ``"A"``, ``"B"``
+        - ``component_type`` (str | None): raw type string from the API, e.g.
+          ``"ballistic_cannon"``, ``"laser_repeater"``, ``"weapon_gun"``
+        - ``class_name`` (str | None): internal class identifier, e.g. ``"GLSN_Shiv"``
         - ``manufacturer`` (str | None): manufacturer name
 
         Returns a dict with keys: ``weapons``, ``shields``, ``power``,
@@ -138,17 +141,48 @@ class WikiClient:
             "other": [],
         }
 
+
+
         # ------------------------------------------------------------------
         # Attempt to parse detailed component data from include=components
         # ------------------------------------------------------------------
         components: list[Any] = ship_data.get("components") or []
         if components and isinstance(components, list):
+            # Log the first component's full structure so we can see every
+            # available field and identify where the real type name lives.
+            first_comp = next((c for c in components if isinstance(c, dict)), None)
+            if first_comp is not None:
+                log.debug(
+                    "Wiki API component keys: %s",
+                    list(first_comp.keys()),
+                )
+                log.debug(
+                    "Wiki API first component data: %s",
+                    first_comp,
+                )
+
             for comp in components:
                 if not isinstance(comp, dict):
                     continue
 
-                # Determine the hardpoint category from the component type/sub_type
+                # Determine the hardpoint category from the component type/sub_type.
+                # comp_type is used purely for bucket routing below.
                 comp_type: str = str(comp.get("type") or comp.get("sub_type") or "").lower()
+
+                # Extract the most descriptive type label available.  The API
+                # may expose this under several different keys depending on the
+                # endpoint version; try them in order of specificity.
+                raw_item_type: str | None = (
+                    comp.get("item_type")
+                    or comp.get("component_type")
+                    or comp.get("sub_type")
+                    or comp.get("type")
+                    or None
+                )
+                component_type: str | None = (
+                    str(raw_item_type).strip() if raw_item_type else None
+                )
+
                 comp_name: str | None = comp.get("name") or comp.get("component_name") or None
                 comp_class: str | None = comp.get("class") or comp.get("item_class") or None
                 comp_size_raw = comp.get("size") or comp.get("item_size") or None
@@ -158,14 +192,18 @@ class WikiClient:
                     or (comp.get("manufacturer_data") or {}).get("name")
                     or None
                 )
+                class_name: str | None = comp.get("class_name") or None
 
                 entry: dict[str, Any] = {
                     "count": 1,
                     "size": comp_size,
                     "component_name": comp_name,
                     "component_class": comp_class,
+                    "component_type": component_type,
+                    "class_name": class_name,
                     "manufacturer": manufacturer,
                 }
+
 
                 if any(kw in comp_type for kw in ("weapon", "gun", "laser", "cannon", "repeater", "ballistic")):
                     buckets["weapons"].append(entry)
