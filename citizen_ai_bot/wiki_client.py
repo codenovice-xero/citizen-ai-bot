@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -159,6 +160,11 @@ class WikiClient:
                 log.debug(
                     "Wiki API first component data: %s",
                     first_comp,
+                )
+                print(
+                    "[WikiClient] first component structure:\n"
+                    + json.dumps(first_comp, indent=2, default=str),
+                    flush=True,
                 )
 
             for comp in components:
