@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
@@ -312,28 +313,38 @@ def _classify_ship_type(ship_data: dict) -> str:
 
 _GENERIC_WEAPON_NAMES: frozenset[str] = frozenset({
     "weapon", "weapons", "gun", "guns", "laser", "cannon", "repeater",
-    "ballistic", "energy", "hardpoint",
+    "ballistic", "energy", "hardpoint", "missile", "missiles", "turret",
+    "weapon gun", "weapon_gun",
 })
 
 _GENERIC_COMPONENT_NAMES: frozenset[str] = frozenset({
-    "shield", "shield generator", "shields",
-    "power plant", "power", "powerplant",
+    "shield", "shield generator", "shield generators", "shields",
+    "power plant", "power", "powerplant", "power plants",
     "cooler", "coolers",
 })
+
+# Matches size-prefixed generic names the API returns as placeholders,
+# e.g. "S3 Weapon", "S2 Missiles", "S1 Shield Generator".
+_SIZE_PREFIXED_GENERIC_RE = re.compile(
+    r"^s\d+\s+(weapon|weapons|gun|guns|missile|missiles|shield|shield generator"
+    r"|shield generators|cooler|coolers|power|power plant|turret)s?$",
+    re.IGNORECASE,
+)
 
 
 def _clean_component_name(hp: dict) -> str:
     """Return a human-readable component label from a hardpoint entry dict.
 
-    Filters out generic placeholder names (e.g. "Weapon", "Shield Generator")
-    and constructs a richer label from size, class, type, and manufacturer
-    fields when the raw name is too generic.
+    Filters out generic placeholder names (e.g. "Weapon", "S3 Weapon",
+    "Shield Generators") and constructs a richer label from size, class,
+    type, and manufacturer fields when the raw name is too generic.
 
-    Uses ``component_type`` (extracted from the Wiki API's ``item_type``,
-    ``sub_type``, or ``type`` fields) to build a descriptive name when the
-    ``component_name`` field is absent or too generic.  For example, a
-    ``component_type`` of ``"ballistic_cannon"`` becomes ``"Ballistic Cannon"``,
-    and ``"laser_repeater"`` becomes ``"Laser Repeater"``.
+    Uses ``component_type`` (extracted from the Wiki API's ``type`` field)
+    as the primary name source when available, since it carries the actual
+    weapon/component category (e.g. ``"ballistic_cannon"`` → ``"Ballistic
+    Cannon"``, ``"laser_repeater"`` → ``"Laser Repeater"``).  The raw
+    ``component_name`` is only used when ``component_type`` is absent and
+    the name is specific enough to be meaningful.
     """
     raw_name: str = str(hp.get("component_name") or "").strip()
     comp_class: str | None = hp.get("component_class")
@@ -341,17 +352,49 @@ def _clean_component_name(hp: dict) -> str:
     manufacturer: str | None = hp.get("manufacturer")
     component_type: str | None = hp.get("component_type")
 
+    # Debug: log the full hp dict and extracted component_type so we can
+    # verify that the type field is flowing through from wiki_client.py.
+    print(f"[DEBUG _clean_component_name] hp={hp!r}")
+    print(f"[DEBUG _clean_component_name] component_type={component_type!r}")
+
     # Convert a snake_case or space-separated type string into Title Case.
     # e.g. "ballistic_cannon" -> "Ballistic Cannon", "weapon_gun" -> "Weapon Gun"
     def _type_to_label(t: str) -> str:
         return " ".join(word.capitalize() for word in t.replace("_", " ").split())
 
-    # Detect whether the raw name is too generic to be useful
-    is_generic = _norm(raw_name) in _GENERIC_WEAPON_NAMES or _norm(raw_name) in _GENERIC_COMPONENT_NAMES
+    # Detect whether the raw name is too generic to be useful.
+    # This covers:
+    #   - Single-word generics: "Weapon", "Shield", "Cooler"
+    #   - Multi-word generics: "Shield Generator", "Power Plant"
+    #   - Size-prefixed API placeholders: "S3 Weapon", "S2 Missiles",
+    #     "S1 Shield Generator" (matched by _SIZE_PREFIXED_GENERIC_RE)
+    normed = _norm(raw_name)
+    is_generic = (
+        normed in _GENERIC_WEAPON_NAMES
+        or normed in _GENERIC_COMPONENT_NAMES
+        or bool(_SIZE_PREFIXED_GENERIC_RE.match(normed))
+    )
 
-    if raw_name and not is_generic:
-        # Good specific name — annotate with size/class/manufacturer if present
+    # Build a synthetic name from available metadata.
+    # Priority: component_type (actual API type) > raw name (only if specific).
+    type_label: str | None = _type_to_label(component_type) if component_type else None
+
+    # If component_type is available, always prefer it — it is the ground-truth
+    # type from the Wiki API and is more informative than any display name.
+    if type_label:
         parts: list[str] = []
+        if size:
+            parts.append(f"Size {size}")
+        parts.append(type_label)
+        if comp_class:
+            parts.append(f"(Class {comp_class})")
+        if manufacturer:
+            parts.append(f"by {manufacturer}")
+        return " ".join(parts)
+
+    # No component_type — fall back to raw name if it is specific enough.
+    if raw_name and not is_generic:
+        parts = []
         if size:
             parts.append(f"Size {size}")
         if comp_class:
@@ -361,23 +404,14 @@ def _clean_component_name(hp: dict) -> str:
             parts.append(f"by {manufacturer}")
         return " ".join(parts)
 
-    # Build a synthetic name from available metadata, preferring component_type
-    # over the raw generic name since it carries more semantic meaning.
-    type_label: str | None = _type_to_label(component_type) if component_type else None
-
+    # Last resort: build from whatever metadata we have.
     parts = []
     if size:
         parts.append(f"Size {size}")
-    if type_label:
-        parts.append(type_label)
-        if comp_class:
-            parts.append(f"(Class {comp_class})")
-    else:
-        if comp_class:
-            parts.append(f"Class {comp_class}")
-        # Fall back to the raw name as a type hint even if generic
-        if raw_name:
-            parts.append(raw_name.title())
+    if comp_class:
+        parts.append(f"Class {comp_class}")
+    if raw_name:
+        parts.append(raw_name.title())
     if manufacturer:
         parts.append(f"by {manufacturer}")
     return " ".join(parts) if parts else "Unknown Component"
