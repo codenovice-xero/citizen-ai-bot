@@ -1,22 +1,14 @@
 # Citizen AI Bot
 
-Discord utility bot for Star Citizen with slash commands for item lookups, trade routes, risk checks, mission guidance, mining suggestions, and ship loadout recommendations enriched with Star Citizen Wiki data.
+Discord utility bot for Star Citizen with slash commands for item lookups, trade routes, risk checks, mission guidance, mining suggestions, and a wiki-driven `/loadout` command.
 
-## Included fixes
+## Highlights
 
-- Clean deployable repo structure instead of a partial patch pack.
-- Proper `requirements.txt` formatting.
-- `.env.example` for first-time setup.
-- `Procfile` for Railway deployment.
-- `/status` now checks both UEX and the Star Citizen Wiki API.
-- `/advice` now actually uses `risk_tolerance`.
-- `/trend` text now clearly describes the result as a live market snapshot.
-- Removed noisy debug prints from the loadout enrichment path.
-
-## Requirements
-
-- Python 3.11+
-- A Discord bot token
+- Deployable repo structure
+- Railway-ready `Procfile`
+- `.env.example` for first-time setup
+- `/status` checks both UEX and the Star Citizen Wiki API
+- `/loadout` now builds from Star Citizen Wiki vehicle data instead of curated static ship blurbs
 
 ## Local setup
 
@@ -25,45 +17,17 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env       # Windows: copy .env.example .env
-```
-
-Fill in `DISCORD_TOKEN` in `.env`, then run:
-
-```bash
 python -m citizen_ai_bot
 ```
 
-## Railway deployment
-
-1. Create a new Railway project from this repo.
-2. Add your environment variables from `.env.example`.
-3. Railway can use the included `Procfile` automatically.
-4. Deploy.
-
-Recommended Railway variables:
+## Environment variables
 
 - `DISCORD_TOKEN`
-- `DISCORD_GUILD_ID` (optional, but useful while testing slash command sync)
-- `UEX_API_TOKEN` (optional unless your UEX usage requires one)
+- `DISCORD_GUILD_ID` (optional)
+- `UEX_API_TOKEN` (optional)
 - `LOG_LEVEL=INFO`
+- `REQUEST_TIMEOUT_SECONDS=25`
 
-## Commands
+## Notes on `/loadout`
 
-- `/helpme`
-- `/status`
-- `/item`
-- `/route`
-- `/multiroute`
-- `/advice`
-- `/loadout`
-- `/mining`
-- `/missions`
-- `/risk`
-- `/trend`
-- `/op`
-
-## Notes
-
-- UEX and Star Citizen Wiki data can change or become temporarily unavailable.
-- Loadout enrichment falls back gracefully when the wiki API does not answer.
-- The market snapshot command is not historical trend analysis.
+The loadout report uses the Star Citizen Wiki API vehicle endpoints and builds its output from the vehicle record, mounted components, exposed port data, and visible weapon stats. When the API only exposes installed items rather than every compatible item, the report reflects the strongest named setup visible from that response.
