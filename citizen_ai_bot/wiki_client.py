@@ -67,27 +67,29 @@ ROLE_HINTS = {
     "ground": "Ground Vehicle",
 }
 
-# Common user-input aliases. Keep these conservative.
 SHIP_ALIASES = {
     "anvil arrow": "Arrow",
     "arrow": "Arrow",
-    "anvil gladius": "Gladius",
     "aegis gladius": "Gladius",
     "gladius": "Gladius",
+    "gladius pirate": "Gladius Pirate",
+    "anvil carrack": "Carrack",
+    "carrack": "Carrack",
+    "drake corsair": "Corsair",
+    "corsair": "Corsair",
     "aegis sabre": "Sabre",
     "sabre": "Sabre",
     "sabrefirebird": "Sabre Firebird",
     "sabre firebird": "Sabre Firebird",
-    "drake corsair": "Corsair",
-    "corsair": "Corsair",
-    "rsi shiv": "Shiv",
-    "shiv": "Shiv",
     "rsi scorpius": "Scorpius",
     "scorpius": "Scorpius",
-    "carrack": "Carrack",
-    "anvil carrack": "Carrack",
-    "vanguard": "Vanguard Warden",
+    "shiv": "GLSN_Shiv",
+    "grey's market shiv": "GLSN_Shiv",
+    "greys market shiv": "GLSN_Shiv",
+    "glsn shiv": "GLSN_Shiv",
+    "rsi shiv": "GLSN_Shiv",
     "aegis vanguard": "Vanguard Warden",
+    "vanguard": "Vanguard Warden",
 }
 
 
@@ -312,11 +314,9 @@ class WikiClient:
         if cached and (now - cached[0]) < _CACHE_TTL:
             return cached[1]
 
-        # Prefer the non-deprecated collection/search style first.
         attempts: list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]] = [
             ("GET", "/api/vehicles", {"search": query, "limit": limit}, None),
             ("GET", "/api/v3/vehicles", {"search": query, "limit": limit}, None),
-            # Deprecated fallback kept on purpose for resilience.
             ("POST", "/api/vehicles/search", {"limit": limit}, {"query": query}),
             ("POST", "/api/v3/vehicles/search", {"limit": limit}, {"query": query}),
         ]
@@ -334,7 +334,6 @@ class WikiClient:
             except Exception as exc:
                 log.debug("Vehicle search attempt failed: %s %s (%s)", method, path, exc)
 
-        # Last-resort client-side fallback: broad fetch without search if supported.
         if not results:
             for path in ("/api/vehicles", "/api/v3/vehicles"):
                 try:
@@ -364,23 +363,61 @@ class WikiClient:
 
     def _rank_vehicle_candidates(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         scored: list[tuple[float, dict[str, Any]]] = []
+        norm_query = _norm(query)
         for candidate in candidates:
             names = self._vehicle_candidate_names(candidate)
             if not names:
                 continue
             score = max(fuzzy_score(query, name) for name in names)
-            norm_query = _norm(query)
             norm_names = {_norm(name) for name in names}
             slug_names = {_slug(name) for name in names}
             if norm_query in norm_names or _slug(norm_query) in slug_names:
                 score += 25
+            if any(norm_query in n for n in norm_names):
+                score += 20
             scored.append((score, candidate))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [candidate for _, candidate in scored]
 
     def _pick_best_vehicle_match(self, query: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-        ranked = self._rank_vehicle_candidates(query, candidates)
-        return ranked[0] if ranked else None
+        ranked: list[tuple[float, dict[str, Any], list[str]]] = []
+
+        norm_query = _norm(query)
+        slug_query = _slug(query)
+
+        for candidate in candidates:
+            names = self._vehicle_candidate_names(candidate)
+            if not names:
+                continue
+
+            score = max(fuzzy_score(query, name) for name in names)
+            norm_names = {_norm(name) for name in names}
+            slug_names = {_slug(name) for name in names}
+
+            if norm_query in norm_names or slug_query in slug_names:
+                score += 40
+            if any(norm_query in n for n in norm_names):
+                score += 20
+
+            ranked.append((score, candidate, names))
+
+        if not ranked:
+            return None
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_candidate, best_names = ranked[0]
+        best_norm_names = {_norm(name) for name in best_names}
+
+        if not any(
+            norm_query == n
+            or norm_query in n
+            or any(token and token in n for token in norm_query.split())
+            for n in best_norm_names
+        ):
+            log.warning("Rejected weak vehicle match for %r: %r (score=%s)", query, best_names, best_score)
+            return None
+
+        return best_candidate
 
     def _vehicle_lookup_candidates(self, ship_name: str) -> list[str]:
         raw = ship_name.strip()
@@ -391,22 +428,20 @@ class WikiClient:
         for value in (
             alias,
             raw,
-            raw.replace("-", " "),
-            _slug(raw),
             raw.title(),
+            raw.upper() if "_" in raw else None,
+            _slug(raw),
         ):
             if value and value not in candidates:
                 candidates.append(value)
 
-        # Strip likely manufacturer prefix.
         tokens = raw.split()
         if len(tokens) > 1:
             stripped = " ".join(tokens[1:])
-            if stripped and stripped not in candidates:
-                candidates.append(stripped)
-                candidates.append(_slug(stripped))
+            for value in (stripped, stripped.title(), _slug(stripped)):
+                if value and value not in candidates:
+                    candidates.append(value)
 
-        # URL-safe forms.
         out: list[str] = []
         for value in candidates:
             if value and value not in out:
@@ -417,12 +452,22 @@ class WikiClient:
         return out
 
     async def _fetch_vehicle(self, ship_name: str) -> dict[str, Any] | None:
+        if _norm(ship_name) == "shiv":
+            data = await self._try_paths(self._vehicle_detail_paths("GLSN_Shiv"))
+            if isinstance(data, dict) and data:
+                return data
+
         for candidate in self._vehicle_lookup_candidates(ship_name):
             data = await self._try_paths(self._vehicle_detail_paths(candidate))
             if isinstance(data, dict) and data:
                 return data
 
         matches = await self.search_vehicle(ship_name)
+        log.warning(
+            "Vehicle search candidates for %r: %s",
+            ship_name,
+            [self._vehicle_candidate_names(m)[:3] for m in matches[:5]],
+        )
         match = self._pick_best_vehicle_match(ship_name, matches)
         if not match:
             log.warning("No vehicle match found for %r", ship_name)
@@ -737,7 +782,6 @@ class WikiClient:
             if component:
                 grouped[component.category].append(component)
 
-        # Fallback: some vehicles only expose mounted items inside ports.
         if not grouped:
             for port in self._extract_port_records(vehicle):
                 category = self._classify_component(port)
