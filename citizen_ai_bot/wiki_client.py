@@ -267,10 +267,7 @@ class WikiClient:
                                 _resolved = _resolved or str(_nt).strip()
                                 break
 
-                    # 3. class_name as a last-resort hint (e.g. "GLSN_Shiv" → keep raw)
-                    if not _resolved and comp.get("class_name"):
-                        _resolved = str(comp["class_name"]).strip()
-
+                    
                     if _resolved:
                         log.debug(
                             "Wiki API: resolved specific type %r from aggregated %r (comp name=%r)",

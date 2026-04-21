@@ -204,14 +204,14 @@ def get_loadout_suggestion(
 
     exact = next((item for item in CURATED_LOADOUTS if _norm(item.ship_name) == _norm(requested_ship)), None)
     if exact:
-        return _enrich_loadout(exact, wiki_enrichment) if wiki_enrichment else exact
+        return _enrich_loadout(exact, wiki_enrichment, preserve_role=True) if wiki_enrichment else exact
 
     best = max(CURATED_LOADOUTS, key=lambda item: _similarity(item.ship_name, requested_ship), default=None)
     if best and _similarity(best.ship_name, requested_ship) >= 0.82:
-        return _enrich_loadout(best, wiki_enrichment) if wiki_enrichment else best
+        return _enrich_loadout(best, wiki_enrichment, preserve_role=True) if wiki_enrichment else best
 
     base = _build_dynamic_loadout(requested_ship)
-    return _enrich_loadout(base, wiki_enrichment) if wiki_enrichment else base
+    return _enrich_loadout(base, wiki_enrichment, preserve_role=False) if wiki_enrichment else base
 
 
 async def get_wiki_loadout(
@@ -323,6 +323,14 @@ _GENERIC_COMPONENT_NAMES: frozenset[str] = frozenset({
     "cooler", "coolers",
 })
 
+_GENERIC_COMPONENT_CLASSES: frozenset[str] = frozenset({
+    "rsiweapon", "rsimodular", "weapon", "modular", "missile", "missilerack",
+})
+
+_GENERIC_MANUFACTURERS: frozenset[str] = frozenset({
+    "tbd", "unknown", "n/a", "na", "none",
+})
+
 # Matches size-prefixed generic names the API returns as placeholders,
 # e.g. "S3 Weapon", "S2 Missiles", "S1 Shield Generator".
 _SIZE_PREFIXED_GENERIC_RE = re.compile(
@@ -332,37 +340,64 @@ _SIZE_PREFIXED_GENERIC_RE = re.compile(
 )
 
 
+def _clean_manufacturer(value: str | None) -> str | None:
+    manufacturer = str(value or "").strip()
+    if not manufacturer or _norm(manufacturer) in _GENERIC_MANUFACTURERS:
+        return None
+    return manufacturer
+
+
+def _clean_component_class(value: str | None) -> str | None:
+    comp_class = str(value or "").strip()
+    if not comp_class:
+        return None
+    normed = _norm(comp_class).replace(" ", "")
+    if normed in _GENERIC_COMPONENT_CLASSES:
+        return None
+    if comp_class.upper().startswith("RSI"):
+        return None
+    return comp_class
+
+
+def _looks_internal_component_type(value: str | None) -> bool:
+    token = str(value or "").strip()
+    if not token:
+        return False
+    lowered = token.lower()
+    if lowered in _GENERIC_COMPONENT_CLASSES:
+        return True
+    if lowered in _GENERIC_WEAPON_NAMES or lowered in _GENERIC_COMPONENT_NAMES:
+        return True
+    if lowered.startswith("rsi"):
+        return True
+    return bool(re.match(r"^[A-Z0-9_]{4,}$", token)) or bool(re.match(r"^[A-Za-z]{3,}_[A-Za-z0-9_]+$", token))
+
+
+def _label_is_specific(label: str) -> bool:
+    normed = _norm(label)
+    if not normed or normed == "unknown component":
+        return False
+    if " by tbd" in normed:
+        return False
+    generic_fragments = (
+        "class rsiweapon", "class rsimodular", "weapon)", "modular)",
+        "size m shields", "size m shield generators", "size m power plants", "size m coolers",
+        "size 3 missiles", "size 4 weapons",
+    )
+    return not any(fragment in normed for fragment in generic_fragments)
+
+
 def _clean_component_name(hp: dict) -> str:
-    """Return a human-readable component label from a hardpoint entry dict.
-
-    Filters out generic placeholder names (e.g. "Weapon", "S3 Weapon",
-    "Shield Generators") and constructs a richer label from size, class,
-    type, and manufacturer fields when the raw name is too generic.
-
-    Uses ``component_type`` (extracted from the Wiki API's ``type`` field)
-    as the primary name source when available, since it carries the actual
-    weapon/component category (e.g. ``"ballistic_cannon"`` → ``"Ballistic
-    Cannon"``, ``"laser_repeater"`` → ``"Laser Repeater"``).  The raw
-    ``component_name`` is only used when ``component_type`` is absent and
-    the name is specific enough to be meaningful.
-    """
+    """Return a human-readable component label from a hardpoint entry dict."""
     raw_name: str = str(hp.get("component_name") or "").strip()
-    comp_class: str | None = hp.get("component_class")
+    comp_class: str | None = _clean_component_class(hp.get("component_class"))
     size: str | None = hp.get("size")
-    manufacturer: str | None = hp.get("manufacturer")
+    manufacturer: str | None = _clean_manufacturer(hp.get("manufacturer"))
     component_type: str | None = hp.get("component_type")
 
-    # Convert a snake_case or space-separated type string into Title Case.
-    # e.g. "ballistic_cannon" -> "Ballistic Cannon", "weapon_gun" -> "Weapon Gun"
     def _type_to_label(t: str) -> str:
         return " ".join(word.capitalize() for word in t.replace("_", " ").split())
 
-    # Detect whether the raw name is too generic to be useful.
-    # This covers:
-    #   - Single-word generics: "Weapon", "Shield", "Cooler"
-    #   - Multi-word generics: "Shield Generator", "Power Plant"
-    #   - Size-prefixed API placeholders: "S3 Weapon", "S2 Missiles",
-    #     "S1 Shield Generator" (matched by _SIZE_PREFIXED_GENERIC_RE)
     normed = _norm(raw_name)
     is_generic = (
         normed in _GENERIC_WEAPON_NAMES
@@ -370,12 +405,11 @@ def _clean_component_name(hp: dict) -> str:
         or bool(_SIZE_PREFIXED_GENERIC_RE.match(normed))
     )
 
-    # Build a synthetic name from available metadata.
-    # Priority: component_type (actual API type) > raw name (only if specific).
+    if component_type and _looks_internal_component_type(component_type):
+        component_type = None
+
     type_label: str | None = _type_to_label(component_type) if component_type else None
 
-    # If component_type is available, always prefer it — it is the ground-truth
-    # type from the Wiki API and is more informative than any display name.
     if type_label:
         parts: list[str] = []
         if size:
@@ -387,26 +421,22 @@ def _clean_component_name(hp: dict) -> str:
             parts.append(f"by {manufacturer}")
         return " ".join(parts)
 
-    # No component_type — fall back to raw name if it is specific enough.
     if raw_name and not is_generic:
         parts = []
         if size:
             parts.append(f"Size {size}")
+        parts.append(raw_name)
         if comp_class:
             parts.append(f"(Class {comp_class})")
-        parts.append(raw_name)
         if manufacturer:
             parts.append(f"by {manufacturer}")
         return " ".join(parts)
 
-    # Last resort: build from whatever metadata we have.
     parts = []
     if size:
         parts.append(f"Size {size}")
     if comp_class:
         parts.append(f"Class {comp_class}")
-    if raw_name:
-        parts.append(raw_name.title())
     if manufacturer:
         parts.append(f"by {manufacturer}")
     return " ".join(parts) if parts else "Unknown Component"
@@ -464,9 +494,8 @@ def _recommend_weapons(ship_type: str, hardpoints: dict) -> list[str]:
 
     # --- Actual Wiki hardpoint data ---
     if weapon_hps:
-        spec_counts: Counter = Counter(
-            _clean_component_name(hp) for hp in weapon_hps if _clean_component_name(hp)
-        )
+        specific_labels = [label for hp in weapon_hps if (label := _clean_component_name(hp)) and _label_is_specific(label)]
+        spec_counts: Counter = Counter(specific_labels)
         if spec_counts:
             lines = [
                 f"{cnt}× {spec}" if cnt > 1 else spec
@@ -474,18 +503,16 @@ def _recommend_weapons(ship_type: str, hardpoints: dict) -> list[str]:
             ]
             recommendations.append("Equipped: " + ", ".join(lines))
         else:
-            sizes = sorted({str(hp["size"]) for hp in weapon_hps if hp.get("size")})
-            if sizes:
-                recommendations.append(
-                    f"{len(weapon_hps)} weapon slot(s) — sizes {', '.join(sizes)}"
-                )
+            size_counts: Counter = Counter(str(hp["size"]) for hp in weapon_hps if hp.get("size"))
+            if size_counts:
+                lines = [f"{count}× Size {size} weapon hardpoint{'s' if count != 1 else ''}" for size, count in sorted(size_counts.items())]
+                recommendations.append("Hardpoints: " + ", ".join(lines))
             else:
                 recommendations.append(f"{len(weapon_hps)} weapon hardpoint(s)")
 
     if missile_hps:
-        spec_counts_m: Counter = Counter(
-            _clean_component_name(hp) for hp in missile_hps if _clean_component_name(hp)
-        )
+        specific_missiles = [label for hp in missile_hps if (label := _clean_component_name(hp)) and _label_is_specific(label)]
+        spec_counts_m: Counter = Counter(specific_missiles)
         if spec_counts_m:
             lines_m = [
                 f"{cnt}× {spec}" if cnt > 1 else spec
@@ -493,7 +520,12 @@ def _recommend_weapons(ship_type: str, hardpoints: dict) -> list[str]:
             ]
             recommendations.append("Missiles: " + ", ".join(lines_m))
         else:
-            recommendations.append(f"{len(missile_hps)} missile hardpoint(s)")
+            missile_size_counts: Counter = Counter(str(hp["size"]) for hp in missile_hps if hp.get("size"))
+            if missile_size_counts:
+                lines_m = [f"{count}× Size {size} missile rack{'s' if count != 1 else ''}" for size, count in sorted(missile_size_counts.items())]
+                recommendations.append("Missiles: " + ", ".join(lines_m))
+            else:
+                recommendations.append(f"{len(missile_hps)} missile hardpoint(s)")
 
     return recommendations
 
@@ -553,9 +585,19 @@ def _recommend_components(ship_type: str, performance: dict) -> dict[str, str]:
     return recommendations.get(ship_type, recommendations["Multirole"])
 
 
+def _slot_summary(hps: list[dict], singular_label: str) -> str:
+    size_counts: Counter = Counter(str(hp["size"]) for hp in hps if hp.get("size"))
+    if size_counts:
+        parts = [f"{count}× Size {size} {singular_label}{'s' if count != 1 else ''}" for size, count in sorted(size_counts.items())]
+        return ", ".join(parts)
+    count = len(hps)
+    return f"{count} {singular_label}{'s' if count != 1 else ''} detected"
+
+
 def _enrich_loadout(
     base: LoadoutSuggestion,
     wiki_data: dict,
+    preserve_role: bool = False,
 ) -> LoadoutSuggestion:
     """Return a new :class:`LoadoutSuggestion` built from data-driven recommendations.
 
@@ -595,7 +637,7 @@ def _enrich_loadout(
     # Only override the curated role when we have real performance data to
     # base the classification on; otherwise keep the curated label.
     has_perf_data = bool(performance.get("max_speed") or performance.get("cargo_scu") or performance.get("max_crew"))
-    role = _type_to_role.get(ship_type, base.role) if has_perf_data else base.role
+    role = base.role if preserve_role else (_type_to_role.get(ship_type, base.role) if has_perf_data else base.role)
 
     # ------------------------------------------------------------------
     # 2. Weapon recommendations (role-based + Wiki hardpoint specs)
@@ -615,7 +657,7 @@ def _enrich_loadout(
         return _clean_component_name(hp)
 
     def _has_detail(hps: list[dict]) -> bool:
-        return any(hp.get("size") or hp.get("component_name") or hp.get("component_class") for hp in hps)
+        return any(_label_is_specific(_comp_spec(hp)) for hp in hps if _comp_spec(hp))
 
     # ------------------------------------------------------------------
     # 4. Shields — advisory + Wiki specs
@@ -624,13 +666,13 @@ def _enrich_loadout(
     shield_hps = hardpoints.get("shields") or []
     if shield_hps:
         if _has_detail(shield_hps):
-            specs = [_comp_spec(hp) for hp in shield_hps[:2] if _comp_spec(hp)]
+            specs = [_comp_spec(hp) for hp in shield_hps[:2] if _comp_spec(hp) and _label_is_specific(_comp_spec(hp))]
             if specs:
                 shields.append("Installed: " + ", ".join(specs))
             else:
-                shields.append(f"{len(shield_hps)} shield slot(s) detected")
+                shields.append(_slot_summary(shield_hps, "shield slot"))
         else:
-            shields.append(f"{len(shield_hps)} shield slot(s) detected")
+            shields.append(_slot_summary(shield_hps, "shield slot"))
 
     # ------------------------------------------------------------------
     # 5. Power — advisory + Wiki specs
@@ -639,13 +681,13 @@ def _enrich_loadout(
     power_hps = hardpoints.get("power") or []
     if power_hps:
         if _has_detail(power_hps):
-            specs = [_comp_spec(hp) for hp in power_hps[:2] if _comp_spec(hp)]
+            specs = [_comp_spec(hp) for hp in power_hps[:2] if _comp_spec(hp) and _label_is_specific(_comp_spec(hp))]
             if specs:
                 power.append("Installed: " + ", ".join(specs))
             else:
-                power.append(f"{len(power_hps)} power slot(s) detected")
+                power.append(_slot_summary(power_hps, "power slot"))
         else:
-            power.append(f"{len(power_hps)} power slot(s) detected")
+            power.append(_slot_summary(power_hps, "power slot"))
 
     # ------------------------------------------------------------------
     # 6. Coolers — advisory + Wiki specs
@@ -654,13 +696,13 @@ def _enrich_loadout(
     cooler_hps = hardpoints.get("coolers") or []
     if cooler_hps:
         if _has_detail(cooler_hps):
-            specs = [_comp_spec(hp) for hp in cooler_hps[:2] if _comp_spec(hp)]
+            specs = [_comp_spec(hp) for hp in cooler_hps[:2] if _comp_spec(hp) and _label_is_specific(_comp_spec(hp))]
             if specs:
                 coolers.append("Installed: " + ", ".join(specs))
             else:
-                coolers.append(f"{len(cooler_hps)} cooler slot(s) detected")
+                coolers.append(_slot_summary(cooler_hps, "cooler slot"))
         else:
-            coolers.append(f"{len(cooler_hps)} cooler slot(s) detected")
+            coolers.append(_slot_summary(cooler_hps, "cooler slot"))
 
     # ------------------------------------------------------------------
     # 7. Notes — performance metrics summary
@@ -679,7 +721,8 @@ def _enrich_loadout(
         perf_lines.append(f"crew {performance['max_crew']}")
     if perf_lines:
         notes.append(f"Performance — {', '.join(perf_lines)}.")
-    notes.append(f"Classified as **{ship_type}** based on Wiki stats ({wiki_ship_name}).")
+    if not preserve_role and role != base.role:
+        notes.append(f"Wiki profile suggests **{role}** for {wiki_ship_name}.")
 
     return LoadoutSuggestion(
         ship_name=base.ship_name,
