@@ -83,13 +83,17 @@ SHIP_ALIASES = {
     "sabre firebird": "Sabre Firebird",
     "rsi scorpius": "Scorpius",
     "scorpius": "Scorpius",
-    "shiv": "GLSN_Shiv",
-    "grey's market shiv": "GLSN_Shiv",
-    "greys market shiv": "GLSN_Shiv",
-    "glsn shiv": "GLSN_Shiv",
-    "rsi shiv": "GLSN_Shiv",
+    "shiv": "Shiv",
+    "grey's market shiv": "Shiv",
+    "greys market shiv": "Shiv",
+    "glsn shiv": "Shiv",
     "aegis vanguard": "Vanguard Warden",
     "vanguard": "Vanguard Warden",
+}
+
+# Hard fallback UUIDs for edge cases where the API resolves best by UUID.
+HARD_UUID_LOOKUPS = {
+    "shiv": "3a7bfe4f-7a6c-4818-aba8-0f1019c3a647",
 }
 
 
@@ -350,7 +354,7 @@ class WikiClient:
 
     def _vehicle_candidate_names(self, candidate: dict[str, Any]) -> list[str]:
         names: list[str] = []
-        for key in ("name", "name_full", "slug", "uuid", "title"):
+        for key in ("name", "name_full", "slug", "uuid", "title", "class_name"):
             value = candidate.get(key)
             if isinstance(value, str) and value.strip():
                 names.append(value.strip())
@@ -364,18 +368,24 @@ class WikiClient:
     def _rank_vehicle_candidates(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         scored: list[tuple[float, dict[str, Any]]] = []
         norm_query = _norm(query)
+        slug_query = _slug(query)
+
         for candidate in candidates:
             names = self._vehicle_candidate_names(candidate)
             if not names:
                 continue
+
             score = max(fuzzy_score(query, name) for name in names)
             norm_names = {_norm(name) for name in names}
             slug_names = {_slug(name) for name in names}
-            if norm_query in norm_names or _slug(norm_query) in slug_names:
+
+            if norm_query in norm_names or slug_query in slug_names:
                 score += 25
             if any(norm_query in n for n in norm_names):
                 score += 20
+
             scored.append((score, candidate))
+
         scored.sort(key=lambda item: item[0], reverse=True)
         return [candidate for _, candidate in scored]
 
@@ -452,8 +462,11 @@ class WikiClient:
         return out
 
     async def _fetch_vehicle(self, ship_name: str) -> dict[str, Any] | None:
-        if _norm(ship_name) == "shiv":
-            data = await self._try_paths(self._vehicle_detail_paths("GLSN_Shiv"))
+        norm_name = _norm(ship_name)
+
+        hard_uuid = HARD_UUID_LOOKUPS.get(norm_name)
+        if hard_uuid:
+            data = await self._try_paths(self._vehicle_detail_paths(hard_uuid))
             if isinstance(data, dict) and data:
                 return data
 
@@ -466,19 +479,21 @@ class WikiClient:
         log.warning(
             "Vehicle search candidates for %r: %s",
             ship_name,
-            [self._vehicle_candidate_names(m)[:3] for m in matches[:5]],
+            [self._vehicle_candidate_names(m)[:4] for m in matches[:5]],
         )
+
         match = self._pick_best_vehicle_match(ship_name, matches)
         if not match:
             log.warning("No vehicle match found for %r", ship_name)
             return None
 
         target = _first_non_empty(
+            match.get("uuid"),
             match.get("slug"),
             match.get("name"),
             match.get("name_full"),
-            match.get("uuid"),
             match.get("title"),
+            match.get("class_name"),
         )
         if not isinstance(target, str):
             log.warning("Vehicle search match for %r had no usable identifier", ship_name)
