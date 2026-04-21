@@ -18,20 +18,35 @@ def error_embed(title: str, message: str) -> discord.Embed:
     return _base_embed(f"❌ {title}", message, color=discord.Color.red())
 
 
-def status_embed(healthy: bool) -> discord.Embed:
-    if healthy:
-        embed = _base_embed("🟢 Citizen AI Status", "All systems look good and the UEX API responded.", color=discord.Color.green())
-        embed.add_field(name="Bot", value="Online", inline=True)
-        embed.add_field(name="UEX", value="Reachable", inline=True)
+def status_embed(status: dict[str, bool]) -> discord.Embed:
+    uex_ok = bool(status.get("uex"))
+    wiki_ok = bool(status.get("wiki"))
+
+    if uex_ok and wiki_ok:
+        embed = _base_embed(
+            "🟢 Citizen AI Status",
+            "Discord is online and both external data services responded.",
+            color=discord.Color.green(),
+        )
     else:
-        embed = _base_embed("🟡 Citizen AI Status", "The bot is online, but the UEX health check did not answer cleanly.", color=discord.Color.gold())
-        embed.add_field(name="Bot", value="Online", inline=True)
-        embed.add_field(name="UEX", value="Unreachable", inline=True)
+        embed = _base_embed(
+            "🟡 Citizen AI Status",
+            "The bot is online, but one or more data providers did not answer cleanly.",
+            color=discord.Color.gold(),
+        )
+
+    embed.add_field(name="Bot", value="Online", inline=True)
+    embed.add_field(name="UEX", value="Reachable" if uex_ok else "Unreachable", inline=True)
+    embed.add_field(name="Wiki", value="Reachable" if wiki_ok else "Unreachable", inline=True)
     return embed
 
 
 def help_embed() -> discord.Embed:
-    embed = _base_embed("🧠 Citizen AI Commands", "Use slash commands to search items, scan routes, and get curated Star Citizen guidance.", color=discord.Color.blurple())
+    embed = _base_embed(
+        "🧠 Citizen AI Commands",
+        "Use slash commands to search items, scan routes, and get curated Star Citizen guidance.",
+        color=discord.Color.blurple(),
+    )
     embed.add_field(name="Economy", value="`/item`\n`/route`\n`/multiroute`\n`/trend`\n`/risk`", inline=True)
     embed.add_field(name="Guidance", value="`/advice`\n`/missions`\n`/op`", inline=True)
     embed.add_field(name="Ships & Roles", value="`/loadout`\n`/mining`\n`/status`", inline=True)
@@ -103,7 +118,7 @@ def format_route_list(routes: list[RouteSuggestion]) -> discord.Embed:
     if not routes:
         return _base_embed("📈 Route Options", "No routes found for that query. Try a different commodity or a looser origin filter.", color=discord.Color.red())
 
-    embed = _base_embed(f"📈 Top {len(routes)} Route Options", "Ranked by estimated profit, then margin per unit.", color=discord.Color.teal())
+    embed = _base_embed("📈 Top Route Options", "Ranked by estimated profit, then margin per unit.", color=discord.Color.teal())
     for idx, route in enumerate(routes[:5], start=1):
         value = (
             f"**Buy:** {route.buy_location} @ {fmt_credits(route.buy_price)}\n"
@@ -128,7 +143,7 @@ def format_loadout(loadout: LoadoutSuggestion | None, requested_ship: str) -> di
     embed = _base_embed(f"🛠️ {loadout.ship_name} Loadout", f"Role: **{loadout.role}**", color=discord.Color.gold())
     embed.add_field(name="Weapons", value="\n".join(f"• {item}" for item in loadout.weapons) or "n/a", inline=False)
     embed.add_field(name="Shields", value="\n".join(f"• {item}" for item in loadout.shields) or "n/a", inline=True)
-    embed.add_field(name="Power / Coolers", value="\n".join(f"• {item}" for item in loadout.power + loadout.coolers) or "n/a", inline=True)
+    embed.add_field(name="Power / Coolers", value="\n".join(f"• {item}" for item in (loadout.power + loadout.coolers)) or "n/a", inline=True)
     embed.add_field(name="Notes", value="\n".join(f"• {item}" for item in loadout.notes) or "n/a", inline=False)
     return embed
 
@@ -158,7 +173,7 @@ def format_risk(label: str, notes: list[str]) -> discord.Embed:
 
 def format_trend(snapshot: dict) -> discord.Embed:
     route = snapshot["top_route"]
-    embed = _base_embed(f"📊 {snapshot['commodity']} Snapshot", snapshot["trend_note"], color=discord.Color.fuchsia())
+    embed = _base_embed(f"📊 {snapshot['commodity']} Snapshot", snapshot["snapshot_note"], color=discord.Color.fuchsia())
     embed.add_field(name="Best Margin Seen", value=fmt_credits(snapshot["best_margin"]), inline=True)
     embed.add_field(name="Average Margin", value=fmt_credits(snapshot["avg_margin"]), inline=True)
     embed.add_field(name="Top Route Risk", value=getattr(route, "risk_label", None) or "n/a", inline=True)

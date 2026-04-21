@@ -45,6 +45,20 @@ class WikiClient:
     async def close(self) -> None:
         await self._http.aclose()
 
+    async def ping(self) -> bool:
+        try:
+            response = await self._http.get('/vehicles/Gladius')
+            response.raise_for_status()
+            content_type = response.headers.get('content-type', '')
+            if 'json' not in content_type:
+                return False
+            payload = response.json()
+            if isinstance(payload, dict):
+                return bool(payload.get('data') or payload)
+            return False
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

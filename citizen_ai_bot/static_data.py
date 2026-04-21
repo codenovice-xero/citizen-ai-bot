@@ -352,11 +352,6 @@ def _clean_component_name(hp: dict) -> str:
     manufacturer: str | None = hp.get("manufacturer")
     component_type: str | None = hp.get("component_type")
 
-    # Debug: log the full hp dict and extracted component_type so we can
-    # verify that the type field is flowing through from wiki_client.py.
-    print(f"[DEBUG _clean_component_name] hp={hp!r}")
-    print(f"[DEBUG _clean_component_name] component_type={component_type!r}")
-
     # Convert a snake_case or space-separated type string into Title Case.
     # e.g. "ballistic_cannon" -> "Ballistic Cannon", "weapon_gun" -> "Weapon Gun"
     def _type_to_label(t: str) -> str:
@@ -828,7 +823,11 @@ def get_mining_suggestion(requested_ship: str) -> MiningSuggestion | None:
     return None
 
 
-def build_advice_plan(money: int | float | None = None, ship: str | None = None) -> AdvicePlan:
+def build_advice_plan(
+    money: int | float | None = None,
+    ship: str | None = None,
+    risk_tolerance: str | None = None,
+) -> AdvicePlan:
     money_value = float(money or 0)
     ship_name = (ship or "").strip()
     bullets: list[str] = []
@@ -857,6 +856,17 @@ def build_advice_plan(money: int | float | None = None, ship: str | None = None)
         ])
         title = "Expansion Plan"
         summary = "You have enough capital to optimize your gameplay loop around efficiency instead of pure survival."
+
+    risk_key = _norm(risk_tolerance or "")
+    if risk_key:
+        if any(token in risk_key for token in ["low", "safe", "cautious", "careful"]):
+            bullets.append("Risk profile: stay legal, use shorter routes, and keep enough reserve credits to absorb a bad run.")
+        elif any(token in risk_key for token in ["medium", "balanced", "moderate"]):
+            bullets.append("Risk profile: mix efficient legal income with occasional higher-upside plays when your ship is ready.")
+        elif any(token in risk_key for token in ["high", "aggressive", "danger", "risky"]):
+            bullets.append("Risk profile: you can chase higher-margin combat or trade opportunities, but only after planning extraction first.")
+        else:
+            bullets.append(f"Risk profile: using your stated tolerance of '{risk_tolerance}' as a balanced planning input.")
 
     if ship_name:
         loadout = get_loadout_suggestion(ship_name)

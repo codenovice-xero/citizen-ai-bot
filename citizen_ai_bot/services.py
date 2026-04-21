@@ -26,6 +26,22 @@ class StarCitizenService:
         self._commodity_snapshots: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._commodity_snapshot_ttl: int = 60 * 20
 
+    async def health_status(self) -> dict[str, bool]:
+        uex_ok = False
+        wiki_ok = False
+
+        try:
+            uex_ok = await self.client.ping()
+        except Exception:
+            uex_ok = False
+
+        try:
+            wiki_ok = await self.wiki.ping()
+        except Exception:
+            wiki_ok = False
+
+        return {"uex": uex_ok, "wiki": wiki_ok}
+
     @staticmethod
     def _extract_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(payload.get("data"), list):
@@ -280,7 +296,7 @@ class StarCitizenService:
         return routes[0] if routes else None
 
     def advice_for_player(self, money: float | None, ship: str | None, risk_tolerance: str | None) -> AdvicePlan:
-        return build_advice_plan(money=money, ship=ship)
+        return build_advice_plan(money=money, ship=ship, risk_tolerance=risk_tolerance)
 
     async def suggest_loadout(self, ship_name: str) -> LoadoutSuggestion | None:
         """Return a loadout suggestion for *ship_name*.
@@ -330,7 +346,7 @@ class StarCitizenService:
             "best_margin": max(margins),
             "avg_margin": avg_margin,
             "top_route": routes[0],
-            "trend_note": "Live trend history is not persisted yet; this is a current-market snapshot.",
+            "snapshot_note": "Historical trend storage is not implemented yet; this is a live market snapshot.",
         }
 
     def plan_operation(self, event: str) -> AdvicePlan:
