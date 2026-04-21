@@ -3,14 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .models import AdvicePlan, ItemLocation, ItemMatch, LoadoutSuggestion, MiningSuggestion, RouteSuggestion
-from .static_data import (
-    MISSION_GUIDE,
-    build_advice_plan,
-    get_wiki_loadout,
-    get_loadout_suggestion,
-    get_mining_suggestion,
-)
+from .models import AdvicePlan, ItemLocation, ItemMatch, LoadoutReport, MiningSuggestion, RouteSuggestion
+from .static_data import MISSION_GUIDE, build_advice_plan, get_mining_suggestion
 from .uex_client import UEXClient
 from .wiki_client import WikiClient
 from .utils import clamp, fuzzy_score
@@ -298,16 +292,8 @@ class StarCitizenService:
     def advice_for_player(self, money: float | None, ship: str | None, risk_tolerance: str | None) -> AdvicePlan:
         return build_advice_plan(money=money, ship=ship, risk_tolerance=risk_tolerance)
 
-    async def suggest_loadout(self, ship_name: str) -> LoadoutSuggestion | None:
-        """Return a loadout suggestion for *ship_name*.
-
-        Attempts to enrich the curated suggestion with live hardpoint and
-        performance data from the Star Citizen Wiki API.  Falls back
-        gracefully to the curated / dynamic suggestion if the API is
-        unavailable.
-        """
-        wiki_data = await get_wiki_loadout(ship_name, self.wiki)
-        return get_loadout_suggestion(ship_name, wiki_enrichment=wiki_data)
+    async def suggest_loadout(self, ship_name: str) -> LoadoutReport | None:
+        return await self.wiki.build_loadout_report(ship_name)
 
     def suggest_mining(self, ship_name: str) -> MiningSuggestion | None:
         return get_mining_suggestion(ship_name)

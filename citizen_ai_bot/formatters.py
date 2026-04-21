@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import discord
 
-from .models import AdvicePlan, ItemLocation, ItemMatch, LoadoutSuggestion, MiningSuggestion, RouteSuggestion
+from .models import AdvicePlan, ItemLocation, ItemMatch, LoadoutReport, MiningSuggestion, RouteSuggestion
 from .utils import fmt_credits, fmt_number
 
 BRAND_FOOTER = "Citizen AI • Star Citizen Utility Bot"
@@ -136,14 +136,24 @@ def format_advice(plan: AdvicePlan) -> discord.Embed:
     return embed
 
 
-def format_loadout(loadout: LoadoutSuggestion | None, requested_ship: str) -> discord.Embed:
+def format_loadout(loadout: LoadoutReport | None, requested_ship: str) -> discord.Embed:
     if not loadout:
-        return _base_embed(f"🛠️ {requested_ship}", "No curated loadout entry yet.", color=discord.Color.red())
+        return _base_embed(f"🛠️ {requested_ship}", "No ship data was returned by the Star Citizen Wiki API for that query.", color=discord.Color.red())
 
-    embed = _base_embed(f"🛠️ {loadout.ship_name} Loadout", f"Role: **{loadout.role}**", color=discord.Color.gold())
+    subtitle_bits: list[str] = []
+    if loadout.role:
+        subtitle_bits.append(f"Role: **{loadout.role}**")
+    if loadout.manufacturer:
+        subtitle_bits.append(loadout.manufacturer)
+
+    embed = _base_embed(
+        f"🛠️ {loadout.ship_name} Loadout",
+        " • ".join(subtitle_bits) if subtitle_bits else None,
+        color=discord.Color.gold(),
+    )
     embed.add_field(name="Weapons", value="\n".join(f"• {item}" for item in loadout.weapons) or "n/a", inline=False)
-    embed.add_field(name="Shields", value="\n".join(f"• {item}" for item in loadout.shields) or "n/a", inline=True)
-    embed.add_field(name="Power / Coolers", value="\n".join(f"• {item}" for item in (loadout.power + loadout.coolers)) or "n/a", inline=True)
+    embed.add_field(name="Systems", value="\n".join(f"• {item}" for item in loadout.systems) or "n/a", inline=False)
+    embed.add_field(name="Performance", value="\n".join(f"• {item}" for item in loadout.performance) or "n/a", inline=False)
     embed.add_field(name="Notes", value="\n".join(f"• {item}" for item in loadout.notes) or "n/a", inline=False)
     return embed
 

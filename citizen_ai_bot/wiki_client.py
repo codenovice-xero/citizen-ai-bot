@@ -2,29 +2,183 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from collections import Counter, defaultdict
+from typing import Any, Iterable
+from urllib.parse import quote
 
 import httpx
 
+from .models import LoadoutComponent, LoadoutReport
+from .utils import fuzzy_score
+
 log = logging.getLogger(__name__)
 
-_WIKI_API_BASE = "https://api.star-citizen.wiki/api/v2"
-_CACHE_TTL = 60 * 30  # 30 minutes
+_WIKI_API_BASE = "https://api.star-citizen.wiki"
+_CACHE_TTL = 60 * 30
 
 
-def _norm_ship_name(name: str) -> str:
-    """Normalise a ship name for comparison: lowercase, strip whitespace."""
-    return " ".join((name or "").strip().lower().split())
+WEAPON_KEYWORDS = (
+    "weapon",
+    "gun",
+    "cannon",
+    "repeater",
+    "gatling",
+    "scattergun",
+    "shotgun",
+    "laser",
+    "ballistic",
+    "distortion",
+    "plasma",
+    "railgun",
+    "singe",
+)
+MISSILE_KEYWORDS = ("missile", "torpedo", "bomb", "rocket", "rack")
+SHIELD_KEYWORDS = ("shield",)
+POWER_KEYWORDS = ("power", "powerplant", "power_plant")
+COOLER_KEYWORDS = ("cooler", "cooling")
+
+CATEGORY_LABELS = {
+    "weapons": "Weapons",
+    "missiles": "Missiles",
+    "shields": "Shield Generators",
+    "power": "Power Plants",
+    "coolers": "Coolers",
+}
+
+ROLE_HINTS = {
+    "fighter": "Fighter",
+    "interceptor": "Interceptor",
+    "bomber": "Bomber",
+    "racing": "Racing",
+    "racer": "Racing",
+    "exploration": "Exploration",
+    "expedition": "Exploration",
+    "cargo": "Cargo / Hauling",
+    "freight": "Cargo / Hauling",
+    "hauling": "Cargo / Hauling",
+    "transport": "Transport",
+    "starter": "Starter / Multirole",
+    "multirole": "Multirole",
+    "industrial": "Industrial",
+    "mining": "Mining",
+    "salvage": "Salvage",
+    "medical": "Medical",
+    "dropship": "Dropship",
+    "gunship": "Gunship",
+    "ground": "Ground Vehicle",
+}
+
+
+def _norm(text: str | None) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _slug(text: str | None) -> str:
+    return _norm(text).replace(" ", "-")
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _iter_dicts(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _iter_dicts(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_dicts(item)
+
+
+def _first_non_empty(*values: Any) -> Any | None:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+            continue
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, dict) and value:
+            return value
+        if isinstance(value, list) and value:
+            return value
+    return None
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_int(value: Any) -> int | None:
+    num = _to_float(value)
+    if num is None:
+        return None
+    return int(num)
+
+
+def _fmt_num(value: float | int | None, digits: int = 0) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:,.{digits}f}"
+
+
+def _titleize(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.replace("_", " ").replace("-", " ").strip()
+    if not text:
+        return None
+    return " ".join(part.capitalize() if part.islower() or part.isupper() else part for part in text.split())
+
+
+def _manufacturer_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _first_non_empty(value.get("name"), value.get("short_name"), value.get("code"))
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def _classify_from_text(text: str) -> str | None:
+    lowered = text.lower()
+    if any(word in lowered for word in WEAPON_KEYWORDS):
+        return "weapons"
+    if any(word in lowered for word in MISSILE_KEYWORDS):
+        return "missiles"
+    if any(word in lowered for word in SHIELD_KEYWORDS):
+        return "shields"
+    if any(word in lowered for word in POWER_KEYWORDS):
+        return "power"
+    if any(word in lowered for word in COOLER_KEYWORDS):
+        return "coolers"
+    return None
 
 
 class WikiClient:
-    """Async client for the Star Citizen Wiki ship data API.
-
-    Fetches ship definitions including hardpoint configurations, component
-    specifications, and performance metrics.  Results are cached in-process
-    for ``_CACHE_TTL`` seconds to avoid hammering the upstream API.
-    """
-
     def __init__(self, timeout: float = 20.0) -> None:
         self._http = httpx.AsyncClient(
             base_url=_WIKI_API_BASE,
@@ -32,428 +186,498 @@ class WikiClient:
             follow_redirects=True,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "CitizenAI-DiscordBot/0.3",
+                "User-Agent": "CitizenAI-DiscordBot/0.4",
             },
         )
-        # Per-ship detail cache: ship_key -> (timestamp, dict)
-        self._ship_detail_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        self._vehicle_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def close(self) -> None:
         await self._http.aclose()
 
     async def ping(self) -> bool:
         try:
-            response = await self._http.get('/vehicles/Gladius')
+            response = await self._http.get("/api/v3/vehicles/Gladius")
             response.raise_for_status()
-            content_type = response.headers.get('content-type', '')
-            if 'json' not in content_type:
-                return False
             payload = response.json()
-            if isinstance(payload, dict):
-                return bool(payload.get('data') or payload)
-            return False
+            return isinstance(payload, dict) and bool(payload.get("data") or payload)
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    async def _get_json(self, path: str, *, params: dict[str, Any] | None = None, json: dict[str, Any] | None = None, method: str = "GET") -> Any:
+        response = await self._http.request(method, path, params=params, json=json)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and "data" in payload:
+            return payload.get("data")
+        return payload
 
-    async def _fetch_ship_data(self, ship_name: str) -> dict[str, Any] | None:
-        """Query the Wiki API for *ship_name* and return the raw ship dict.
+    async def search_vehicle(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        data = await self._get_json(
+            "/api/v3/vehicles/search",
+            params={"limit": limit},
+            json={"query": query},
+            method="POST",
+        )
+        return [item for item in _as_list(data) if isinstance(item, dict)]
 
-        The Star Citizen Wiki API exposes individual vehicle records at
-        ``/vehicles/{ship_name}`` where the ship name is passed as a URL path
-        parameter.  The ``include=components`` query parameter is added to
-        request detailed hardpoint/component data when available.  Returns the
-        ship dict directly, or ``None`` if the ship is not found or the API
-        fails.
-        """
-        endpoint = f"/vehicles/{ship_name}"
+    def _pick_best_vehicle_match(self, query: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+        best: tuple[float, dict[str, Any]] | None = None
+        for candidate in candidates:
+            names = [
+                candidate.get("name"),
+                candidate.get("name_full"),
+                candidate.get("slug"),
+                candidate.get("uuid"),
+            ]
+            score = max(fuzzy_score(query, str(name)) for name in names if name)
+            if best is None or score > best[0]:
+                best = (score, candidate)
+        return best[1] if best else None
+
+    async def _fetch_vehicle(self, ship_name: str) -> dict[str, Any] | None:
+        includes = "components,ports,shops"
+        candidates = [ship_name, _slug(ship_name), quote(ship_name), quote(_slug(ship_name))]
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                data = await self._get_json(f"/api/v3/vehicles/{candidate}", params={"include": includes})
+                if isinstance(data, dict) and data:
+                    return data
+            except Exception:
+                continue
+
         try:
-            response = await self._http.get(endpoint, params={"include": "components"})
-            response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "")
-            if "json" not in content_type:
-                log.warning(
-                    "Star Citizen Wiki %s returned unexpected content-type %r; body: %.500s",
-                    endpoint,
-                    content_type,
-                    response.text,
-                )
-                return None
-
-            if not response.text or not response.text.strip():
-                log.warning("Star Citizen Wiki %s returned an empty response body", endpoint)
-                return None
-
-            payload = response.json()
-        except httpx.HTTPError as exc:
-            log.warning("Star Citizen Wiki %s request failed for %r: %s", endpoint, ship_name, exc)
-            return None
+            matches = await self.search_vehicle(ship_name)
         except Exception as exc:
-            log.warning("Star Citizen Wiki unexpected error fetching %r: %s", ship_name, exc)
+            log.warning("Vehicle search failed for %r: %s", ship_name, exc)
             return None
 
-        # The API wraps the ship object in {"data": {...}}.
-        if isinstance(payload, dict):
-            ship_data = payload.get("data") or payload
-            if not ship_data:
-                log.debug("Star Citizen Wiki: no results for ship %r", ship_name)
-                return None
-            log.debug(
-                "Star Citizen Wiki: top-level keys for %r: %s",
-                ship_name,
-                list(ship_data.keys()) if isinstance(ship_data, dict) else type(ship_data).__name__,
-            )
-            return ship_data
+        match = self._pick_best_vehicle_match(ship_name, matches)
+        if not match:
+            return None
 
-        log.warning(
-            "Star Citizen Wiki %s returned unexpected payload type %s",
-            endpoint,
-            type(payload).__name__,
-        )
-        return None
+        target = _first_non_empty(match.get("name"), match.get("name_full"), match.get("slug"))
+        if not isinstance(target, str):
+            return None
 
-
-
-    @staticmethod
-    def _extract_hardpoints(ship_data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-        """Parse raw Wiki ship data into categorised hardpoint buckets.
-
-        When the API returns detailed component data (via ``include=components``)
-        the ``components`` key will contain a list of hardpoint records.  Each
-        record is parsed to extract weapon sizes, component names, classes, and
-        manufacturer info.  If no detailed component data is present the method
-        falls back to the ``weapon_snapshot`` summary counts so the rest of the
-        codebase always receives a consistent structure.
-
-        Each bucket entry is a dict that may contain:
-        - ``count`` (int): always 1 per entry
-        - ``size`` (str | None): e.g. ``"3"`` or ``"S3"``
-        - ``component_name`` (str | None): display name of the equipped item
-        - ``component_class`` (str | None): e.g. ``"A"``, ``"B"``
-        - ``component_type`` (str | None): specific weapon/component type resolved
-          from the API, e.g. ``"ballistic_cannon"``, ``"laser_repeater"``.
-          When the top-level ``type`` field is an aggregated category
-          (``"weapons"``, ``"missiles"``, ``"shield_generators"``) this is
-          resolved from nested ``details``, ``specs``, or ``sub_type`` fields.
-        - ``class_name`` (str | None): internal class identifier, e.g. ``"GLSN_Shiv"``
-        - ``manufacturer`` (str | None): manufacturer name
-
-        Returns a dict with keys: ``weapons``, ``shields``, ``power``,
-        ``coolers``, ``missiles``, ``other``.
-        """
-        buckets: dict[str, list[dict[str, Any]]] = {
-            "weapons": [],
-            "shields": [],
-            "power": [],
-            "coolers": [],
-            "missiles": [],
-            "other": [],
-        }
-
-        # ------------------------------------------------------------------
-        # Debug: log the full set of top-level keys in ship_data so we can
-        # identify every field the API returns, including any separate
-        # "weapons" array, "weapon_snapshot", or other spec containers.
-        # ------------------------------------------------------------------
-        log.debug(
-            "Wiki API ship_data top-level keys: %s",
-            list(ship_data.keys()) if isinstance(ship_data, dict) else type(ship_data).__name__,
-        )
-
-        # Log weapon_snapshot if present — it may contain detailed weapon info
-        # (e.g. individual weapon class names) beyond the summary counts.
-        snapshot_raw: dict[str, Any] = ship_data.get("weapon_snapshot") or {}
-        if snapshot_raw:
-            log.debug("Wiki API weapon_snapshot: %s", snapshot_raw)
-
-        # Log any top-level "weapons" array that is separate from "components"
-        # — the API may expose individual weapon specs here.
-        top_level_weapons: list[Any] = ship_data.get("weapons") or []
-        if top_level_weapons:
-            log.debug(
-                "Wiki API top-level 'weapons' array (%d entries): %s",
-                len(top_level_weapons),
-                top_level_weapons[:3],
-            )
-
-        # Log any other top-level arrays/dicts that look like they could hold
-        # component specifications (e.g. "hardpoints", "loadout", "items").
-        for _candidate_key in ("hardpoints", "loadout", "items", "equipment", "modules"):
-            _candidate_val = ship_data.get(_candidate_key)
-            if _candidate_val:
-                log.debug(
-                    "Wiki API candidate spec field %r: %s",
-                    _candidate_key,
-                    _candidate_val if not isinstance(_candidate_val, list) else _candidate_val[:2],
-                )
-
-        # ------------------------------------------------------------------
-        # Attempt to parse detailed component data from include=components
-        # ------------------------------------------------------------------
-        components: list[Any] = ship_data.get("components") or []
-        if components and isinstance(components, list):
-            # Log the first component's full structure so we can see every
-            # available field and identify where the real type name lives.
-            first_comp = next((c for c in components if isinstance(c, dict)), None)
-            if first_comp is not None:
-                log.debug(
-                    "Wiki API component keys: %s",
-                    list(first_comp.keys()),
-                )
-                log.debug(
-                    "Wiki API first component data: %s",
-                    first_comp,
-                )
-                # Log any nested sub-dicts that might hold the specific type
-                # (e.g. "details", "specs", "item", "component").
-                for _nested_key in ("details", "specs", "item", "component", "sub_type", "weapon_data"):
-                    _nested_val = first_comp.get(_nested_key)
-                    if _nested_val is not None:
-                        log.debug(
-                            "Wiki API first component nested field %r: %s",
-                            _nested_key,
-                            _nested_val,
-                        )
-
-            for comp in components:
-                if not isinstance(comp, dict):
-                    continue
-
-                # Determine the hardpoint category from the component type.
-                # comp_type is used purely for bucket routing below.
-                comp_type: str = str(comp.get("type") or "").lower()
-
-                # The Wiki API's top-level ``type`` field sometimes carries an
-                # aggregated category name (e.g. ``"weapons"``, ``"missiles"``,
-                # ``"shield_generators"``) rather than a specific weapon type.
-                # When that happens, try to resolve the specific type from
-                # nested fields in priority order:
-                #   1. ``sub_type``  — explicit sub-classification
-                #   2. ``details.type`` / ``specs.type`` — nested spec objects
-                #   3. ``item.type`` / ``component.type`` — linked item records
-                #   4. ``weapon_data.type`` — weapon-specific sub-object
-                #   5. ``class_name`` — internal identifier (e.g. "GLSN_Shiv")
-                #      which often encodes the weapon family
-                # Fall back to the raw top-level ``type`` only when nothing
-                # more specific is available.
-                _AGGREGATED_TYPES: frozenset[str] = frozenset({
-                    "weapons", "missiles", "shield_generators", "shields",
-                    "power_plants", "coolers", "turrets", "guns",
-                })
-                raw_type: str | None = comp.get("type") or None
-                component_type: str | None = str(raw_type).strip() if raw_type else None
-
-                if component_type and component_type.lower() in _AGGREGATED_TYPES:
-                    # Top-level type is a generic category — dig for specifics.
-                    _resolved: str | None = None
-
-                    # 1. Explicit sub_type field
-                    _resolved = _resolved or (str(comp["sub_type"]).strip() if comp.get("sub_type") else None)
-
-                    # 2. Nested details / specs objects
-                    for _nk in ("details", "specs", "item", "component", "weapon_data"):
-                        _nested = comp.get(_nk)
-                        if isinstance(_nested, dict):
-                            _nt = _nested.get("type") or _nested.get("sub_type") or _nested.get("name")
-                            if _nt:
-                                _resolved = _resolved or str(_nt).strip()
-                                break
-
-                    
-                    if _resolved:
-                        log.debug(
-                            "Wiki API: resolved specific type %r from aggregated %r (comp name=%r)",
-                            _resolved,
-                            component_type,
-                            comp.get("name"),
-                        )
-                        component_type = _resolved
-                    else:
-                        log.debug(
-                            "Wiki API: could not resolve specific type from aggregated %r "
-                            "(comp name=%r, keys=%s)",
-                            component_type,
-                            comp.get("name"),
-                            list(comp.keys()),
-                        )
-
-                comp_name: str | None = comp.get("name") or None
-                comp_class: str | None = comp.get("component_class") or None
-                comp_size_raw = comp.get("component_size") or comp.get("size") or None
-                comp_size: str | None = str(comp_size_raw) if comp_size_raw is not None else None
-                manufacturer: str | None = (
-                    comp.get("manufacturer")
-                    or (comp.get("manufacturer_data") or {}).get("name")
-                    or None
-                )
-                class_name: str | None = comp.get("class_name") or None
-
-                entry: dict[str, Any] = {
-                    "count": 1,
-                    "size": comp_size,
-                    "component_name": comp_name,
-                    "component_class": comp_class,
-                    "component_type": component_type,
-                    "class_name": class_name,
-                    "manufacturer": manufacturer,
-                }
-
-                if any(kw in comp_type for kw in ("weapon", "gun", "laser", "cannon", "repeater", "ballistic")):
-                    buckets["weapons"].append(entry)
-                elif any(kw in comp_type for kw in ("missile", "torpedo", "rack")):
-                    buckets["missiles"].append(entry)
-                elif any(kw in comp_type for kw in ("shield",)):
-                    buckets["shields"].append(entry)
-                elif any(kw in comp_type for kw in ("power", "powerplant", "power_plant")):
-                    buckets["power"].append(entry)
-                elif any(kw in comp_type for kw in ("cooler",)):
-                    buckets["coolers"].append(entry)
-                else:
-                    buckets["other"].append(entry)
-
-            # If we successfully parsed at least one component, return early.
-            # Fill in any empty shield/power/cooler slots from snapshot data so
-            # the display is never completely blank for those categories.
-            if any(buckets[k] for k in ("weapons", "missiles", "shields", "power", "coolers")):
-                if not buckets["shields"] and ship_data.get("shield_hp"):
-                    buckets["shields"].append({"count": 1, "size": None, "component_name": None,
-                                               "component_class": None, "manufacturer": None})
-                if not buckets["power"]:
-                    buckets["power"].append({"count": 1, "size": None, "component_name": None,
-                                             "component_class": None, "manufacturer": None})
-                if not buckets["coolers"]:
-                    buckets["coolers"].append({"count": 1, "size": None, "component_name": None,
-                                               "component_class": None, "manufacturer": None})
-                return buckets
-
-        # ------------------------------------------------------------------
-        # Fallback: use weapon_snapshot summary counts
-        # ------------------------------------------------------------------
-        snapshot: dict[str, Any] = ship_data.get("weapon_snapshot") or {}
-
-        # Weapons: pilot guns + turret guns
-        pilot_guns: int = int(snapshot.get("pilot_guns_count") or 0)
-        turret_guns: int = int(snapshot.get("turret_weapon_guns_count") or 0)
-        total_weapons = pilot_guns + turret_guns
-        for _ in range(total_weapons):
-            buckets["weapons"].append({"count": 1, "size": None, "component_name": None,
-                                       "component_class": None, "manufacturer": None})
-
-        # Missiles: prefer rack count, fall back to individual missile count
-        missile_racks: int = int(snapshot.get("missile_rack_count") or snapshot.get("missile_count") or 0)
-        for _ in range(missile_racks):
-            buckets["missiles"].append({"count": 1, "size": None, "component_name": None,
-                                        "component_class": None, "manufacturer": None})
-
-        # Shields: 1 slot if the ship has shield HP data
-        if ship_data.get("shield_hp"):
-            buckets["shields"].append({"count": 1, "size": None, "component_name": None,
-                                       "component_class": None, "manufacturer": None})
-
-        # Power and coolers: assume one of each for any ship
-        buckets["power"].append({"count": 1, "size": None, "component_name": None,
-                                 "component_class": None, "manufacturer": None})
-        buckets["coolers"].append({"count": 1, "size": None, "component_name": None,
-                                   "component_class": None, "manufacturer": None})
-
-        return buckets
-
-
-
-    @staticmethod
-    def _extract_performance(ship_data: dict[str, Any]) -> dict[str, Any]:
-        """Pull top-level performance metrics out of raw Wiki ship data.
-
-        The Wiki API returns speed data nested under ``speed`` (with ``scm``
-        and ``max`` sub-keys), crew data nested under ``crew`` (with ``max``),
-        and hull/cargo/shield values at the top level.
-        """
-        perf: dict[str, Any] = {}
-
-        # Speed — nested under ship_data["speed"]["scm"] / ["max"]
-        speed: dict[str, Any] = ship_data.get("speed") or {}
-        if speed.get("scm") is not None:
-            perf["scm_speed"] = speed["scm"]
-        if speed.get("max") is not None:
-            perf["max_speed"] = speed["max"]
-
-        # Shields — top-level key
-        shield_hp = ship_data.get("shield_hp")
-        if shield_hp is not None:
-            perf["shield_hp"] = shield_hp
-
-        # Hull HP — top-level "health" key
-        hull_hp = ship_data.get("health")
-        if hull_hp is not None:
-            perf["hull_hp"] = hull_hp
-
-        # Cargo — top-level "cargo_capacity" key
-        cargo = ship_data.get("cargo_capacity")
-        if cargo is not None:
-            perf["cargo_scu"] = cargo
-
-        # Crew — nested under ship_data["crew"]["max"]
-        crew: dict[str, Any] = ship_data.get("crew") or {}
-        if isinstance(crew, dict) and crew.get("max") is not None:
-            perf["max_crew"] = crew["max"]
-        elif isinstance(crew, (int, float)):
-            perf["max_crew"] = crew
-
-        return perf
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        try:
+            data = await self._get_json(f"/api/v3/vehicles/{quote(target)}", params={"include": includes})
+            return data if isinstance(data, dict) and data else None
+        except Exception:
+            return None
 
     async def get_ship(self, ship_name: str) -> dict[str, Any] | None:
-        """Fetch raw ship data for *ship_name* from the Star Citizen Wiki API.
-
-        Returns the raw ship dict on success, or ``None`` if the ship is not
-        found or the API is unreachable.  Results are cached per ship for
-        ``_CACHE_TTL`` seconds.
-        """
-        key = _norm_ship_name(ship_name)
+        key = _norm(ship_name)
         if not key:
             return None
-
         now = time.monotonic()
-        cached = self._ship_detail_cache.get(key)
-        if cached is not None:
-            ts, data = cached
-            if (now - ts) < _CACHE_TTL:
-                return data
+        cached = self._vehicle_cache.get(key)
+        if cached and (now - cached[0]) < _CACHE_TTL:
+            return cached[1]
+        data = await self._fetch_vehicle(ship_name)
+        if data:
+            self._vehicle_cache[key] = (now, data)
+        return data
 
-        ship_data = await self._fetch_ship_data(ship_name)
-        if ship_data is not None:
-            self._ship_detail_cache[key] = (now, ship_data)
-        return ship_data
+    def _extract_role(self, vehicle: dict[str, Any]) -> str | None:
+        candidates = [
+            vehicle.get("type"),
+            vehicle.get("focus"),
+            vehicle.get("career"),
+            vehicle.get("role"),
+            vehicle.get("vehicle_role"),
+            vehicle.get("vehicle_roles"),
+            vehicle.get("description"),
+        ]
+        text_chunks: list[str] = []
+        for candidate in candidates:
+            if isinstance(candidate, list):
+                text_chunks.extend(str(item) for item in candidate if item)
+            elif candidate:
+                text_chunks.append(str(candidate))
+        for chunk in text_chunks:
+            lowered = chunk.lower()
+            for key, label in ROLE_HINTS.items():
+                if key in lowered:
+                    return label
+        return _titleize(str(text_chunks[0])) if text_chunks else None
+
+    def _extract_manufacturer(self, vehicle: dict[str, Any]) -> str | None:
+        return _manufacturer_name(
+            _first_non_empty(
+                vehicle.get("manufacturer"),
+                vehicle.get("manufacturer_data"),
+                vehicle.get("company"),
+            )
+        )
+
+    def _extract_performance(self, vehicle: dict[str, Any]) -> dict[str, Any]:
+        speed = vehicle.get("speed") or {}
+        crew = vehicle.get("crew") or {}
+        return {
+            "scm_speed": _to_float(speed.get("scm") if isinstance(speed, dict) else None),
+            "max_speed": _to_float(speed.get("max") if isinstance(speed, dict) else None),
+            "hull_hp": _to_float(_first_non_empty(vehicle.get("health"), vehicle.get("hull_hp"), vehicle.get("hit_points"))),
+            "shield_hp": _to_float(_first_non_empty(vehicle.get("shield_hp"), vehicle.get("shields_hp"), vehicle.get("shield_health"))),
+            "cargo_scu": _to_float(_first_non_empty(vehicle.get("cargo_capacity"), vehicle.get("cargo"), vehicle.get("cargo_scu"))),
+            "max_crew": _to_int(crew.get("max") if isinstance(crew, dict) else crew),
+        }
+
+    def _extract_port_records(self, vehicle: dict[str, Any]) -> list[dict[str, Any]]:
+        ports_root = vehicle.get("ports") or []
+        return [item for item in _iter_dicts(ports_root) if isinstance(item, dict)]
+
+    def _extract_components_root(self, vehicle: dict[str, Any]) -> list[dict[str, Any]]:
+        components = vehicle.get("components") or []
+        return [item for item in _as_list(components) if isinstance(item, dict)]
+
+    def _candidate_text(self, obj: dict[str, Any]) -> str:
+        fields = [
+            obj.get("type"),
+            obj.get("sub_type"),
+            obj.get("group"),
+            obj.get("name"),
+            obj.get("class_name"),
+            obj.get("port_type"),
+            obj.get("item_type"),
+            obj.get("category"),
+        ]
+        text = " ".join(str(value) for value in fields if value)
+        for nested_key in ("item", "component", "specs", "details", "weapon_data", "mounted_item", "equipped_item"):
+            nested = obj.get(nested_key)
+            if isinstance(nested, dict):
+                text += " " + self._candidate_text(nested)
+        return text.strip()
+
+    def _extract_size(self, obj: dict[str, Any]) -> str | None:
+        candidates = [
+            obj.get("component_size"),
+            obj.get("size"),
+            obj.get("port_size"),
+            obj.get("item_size"),
+            obj.get("vehicle_weapon_size"),
+            (obj.get("specs") or {}).get("size") if isinstance(obj.get("specs"), dict) else None,
+            (obj.get("details") or {}).get("size") if isinstance(obj.get("details"), dict) else None,
+            (obj.get("item") or {}).get("size") if isinstance(obj.get("item"), dict) else None,
+            (obj.get("component") or {}).get("size") if isinstance(obj.get("component"), dict) else None,
+        ]
+        value = _first_non_empty(*candidates)
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return str(int(value))
+        return str(value)
+
+    def _extract_item_name(self, obj: dict[str, Any]) -> str | None:
+        nested_candidates = []
+        for nested_key in ("item", "component", "mounted_item", "equipped_item", "details", "specs", "weapon_data"):
+            nested = obj.get(nested_key)
+            if isinstance(nested, dict):
+                nested_candidates.append(_first_non_empty(nested.get("name"), nested.get("name_full"), nested.get("label")))
+        value = _first_non_empty(obj.get("name"), obj.get("name_full"), obj.get("label"), *nested_candidates)
+        if not isinstance(value, str):
+            return None
+        cleaned = value.strip()
+        if not cleaned or cleaned.lower() in {"weapon", "weapons", "missile", "missiles", "shield generators", "power plants", "coolers"}:
+            return None
+        return cleaned
+
+    def _extract_item_class(self, obj: dict[str, Any]) -> tuple[str | None, str | None]:
+        family_candidates = [
+            obj.get("item_class"),
+            obj.get("class"),
+            obj.get("type_class"),
+            obj.get("sub_type"),
+            (obj.get("specs") or {}).get("class") if isinstance(obj.get("specs"), dict) else None,
+            (obj.get("details") or {}).get("class") if isinstance(obj.get("details"), dict) else None,
+        ]
+        grade_candidates = [
+            obj.get("component_class"),
+            obj.get("grade"),
+            (obj.get("specs") or {}).get("grade") if isinstance(obj.get("specs"), dict) else None,
+            (obj.get("details") or {}).get("grade") if isinstance(obj.get("details"), dict) else None,
+        ]
+
+        family = _titleize(str(_first_non_empty(*family_candidates))) if _first_non_empty(*family_candidates) else None
+        grade_raw = _first_non_empty(*grade_candidates)
+        grade = None
+        if grade_raw is not None:
+            grade_text = str(grade_raw).strip().upper()
+            if grade_text and not grade_text.startswith("RSI"):
+                grade = grade_text
+        return family, grade
+
+    def _extract_dps(self, obj: dict[str, Any]) -> tuple[float | None, float | None]:
+        direct_dps_keys = (
+            "dps",
+            "damage_per_second",
+            "burst_dps",
+            "sustained_dps",
+            "vehicle_weapon_dps",
+        )
+        direct_alpha_keys = (
+            "alpha_damage",
+            "damage_per_shot",
+            "burst_damage",
+            "vehicle_weapon_alpha",
+        )
+        for key in direct_dps_keys:
+            value = _to_float(obj.get(key))
+            if value is not None:
+                alpha = None
+                for alpha_key in direct_alpha_keys:
+                    alpha = _to_float(obj.get(alpha_key))
+                    if alpha is not None:
+                        break
+                return value, alpha
+
+        nested_dicts = [nested for nested in (obj.get("weapon_data"), obj.get("specs"), obj.get("details"), obj.get("item"), obj.get("component")) if isinstance(nested, dict)]
+        for nested in nested_dicts:
+            dps, alpha = self._extract_dps(nested)
+            if dps is not None or alpha is not None:
+                return dps, alpha
+
+        damage = _first_non_empty(obj.get("damage"), obj.get("damage_data"))
+        damage_total = None
+        if isinstance(damage, dict):
+            damage_total = sum(_to_float(v) or 0.0 for v in damage.values())
+            if damage_total == 0:
+                damage_total = None
+        rpm = _to_float(_first_non_empty(obj.get("rpm"), obj.get("fire_rate"), obj.get("rate_of_fire"), (obj.get("weapon_data") or {}).get("rpm") if isinstance(obj.get("weapon_data"), dict) else None))
+        if damage_total is not None:
+            dps = damage_total * (rpm / 60.0) if rpm else None
+            return dps, damage_total
+        return None, None
+
+    def _extract_count(self, obj: dict[str, Any]) -> int:
+        for key in ("count", "quantity", "qty", "amount"):
+            value = _to_int(obj.get(key))
+            if value and value > 0:
+                return value
+        return 1
+
+    def _classify_component(self, obj: dict[str, Any]) -> str | None:
+        category = _classify_from_text(self._candidate_text(obj))
+        if category:
+            return category
+        name = _extract_item_name(obj)
+        if name:
+            return _classify_from_text(name)
+        return None
+
+    def _component_from_obj(self, obj: dict[str, Any], *, category_override: str | None = None) -> LoadoutComponent | None:
+        category = category_override or self._classify_component(obj)
+        if not category:
+            return None
+        name = self._extract_item_name(obj) or CATEGORY_LABELS.get(category, "Component")
+        size = self._extract_size(obj)
+        item_class, grade = self._extract_item_class(obj)
+        dps, alpha = self._extract_dps(obj)
+        return LoadoutComponent(
+            name=name,
+            category=category,
+            size=size,
+            item_class=item_class,
+            grade=grade,
+            group=_titleize(_first_non_empty(obj.get("group"), obj.get("sub_type"), obj.get("type"))),
+            dps=dps,
+            alpha_damage=alpha,
+            count=self._extract_count(obj),
+            raw=obj,
+        )
+
+    def _extract_installed_components(self, vehicle: dict[str, Any]) -> dict[str, list[LoadoutComponent]]:
+        grouped: dict[str, list[LoadoutComponent]] = defaultdict(list)
+        for obj in self._extract_components_root(vehicle):
+            component = self._component_from_obj(obj)
+            if component:
+                grouped[component.category].append(component)
+
+        # Some APIs only expose equipped items inside ports.
+        if not grouped:
+            for port in self._extract_port_records(vehicle):
+                category = self._classify_component(port)
+                if not category:
+                    continue
+                for nested_key in ("item", "component", "mounted_item", "equipped_item", "details", "specs", "weapon_data"):
+                    nested = port.get(nested_key)
+                    if isinstance(nested, dict):
+                        component = self._component_from_obj(nested, category_override=category)
+                        if component:
+                            if component.size is None:
+                                component.size = self._extract_size(port)
+                            grouped[component.category].append(component)
+                            break
+        return grouped
+
+    def _extract_hardpoint_summary(self, vehicle: dict[str, Any], installed: dict[str, list[LoadoutComponent]]) -> list[str]:
+        counts: dict[str, Counter[str]] = {key: Counter() for key in ("weapons", "missiles", "shields", "power", "coolers")}
+
+        for category, components in installed.items():
+            for component in components:
+                size_label = component.size or "?"
+                counts[category][size_label] += component.count
+
+        for port in self._extract_port_records(vehicle):
+            category = self._classify_component(port)
+            if category not in counts:
+                continue
+            size_label = self._extract_size(port) or "?"
+            counts[category][size_label] += 0 if counts[category][size_label] else 1
+
+        lines: list[str] = []
+        for category in ("weapons", "missiles", "shields", "power", "coolers"):
+            bucket = counts[category]
+            if not bucket:
+                continue
+            parts = [f"{count}x S{size}" if size != "?" else f"{count}x size unknown" for size, count in sorted(bucket.items())]
+            lines.append(f"{CATEGORY_LABELS[category]}: {' • '.join(parts)}")
+        return lines
+
+    def _summarise_components(self, components: list[LoadoutComponent], *, include_dps: bool = False) -> list[str]:
+        grouped: dict[tuple[str, str | None, str | None, str | None, float | None, float | None], int] = defaultdict(int)
+        for component in components:
+            grouped[(component.name, component.size, component.item_class, component.grade, component.dps, component.alpha_damage)] += component.count
+
+        ordered = sorted(
+            grouped.items(),
+            key=lambda item: (
+                item[0][4] or 0.0,
+                item[1],
+                item[0][0],
+            ),
+            reverse=True,
+        )
+
+        lines: list[str] = []
+        for (name, size, item_class, grade, dps, alpha), count in ordered:
+            attrs: list[str] = []
+            if size:
+                attrs.append(f"Size {size}")
+            if item_class:
+                attrs.append(f"Class {item_class}")
+            if grade:
+                attrs.append(f"Grade {grade}")
+            if include_dps and dps is not None:
+                attrs.append(f"{_fmt_num(dps, 0)} DPS each")
+            if include_dps and alpha is not None:
+                attrs.append(f"{_fmt_num(alpha, 0)} alpha")
+            prefix = f"{count}x " if count > 1 else ""
+            lines.append(f"{prefix}{name}" + (f" — {' • '.join(attrs)}" if attrs else ""))
+        return lines
+
+    def _weapon_totals(self, weapons: list[LoadoutComponent]) -> tuple[float | None, float | None]:
+        total_dps = 0.0
+        total_alpha = 0.0
+        any_dps = False
+        any_alpha = False
+        for weapon in weapons:
+            if weapon.dps is not None:
+                total_dps += weapon.dps * max(1, weapon.count)
+                any_dps = True
+            if weapon.alpha_damage is not None:
+                total_alpha += weapon.alpha_damage * max(1, weapon.count)
+                any_alpha = True
+        return (total_dps if any_dps else None, total_alpha if any_alpha else None)
+
+    async def build_loadout_report(self, ship_name: str) -> LoadoutReport | None:
+        vehicle = await self.get_ship(ship_name)
+        if vehicle is None:
+            return None
+
+        vehicle_name = _first_non_empty(vehicle.get("name"), vehicle.get("name_full"), ship_name)
+        if not isinstance(vehicle_name, str):
+            vehicle_name = ship_name
+
+        role = self._extract_role(vehicle)
+        manufacturer = self._extract_manufacturer(vehicle)
+        performance = self._extract_performance(vehicle)
+        installed = self._extract_installed_components(vehicle)
+        hardpoints = self._extract_hardpoint_summary(vehicle, installed)
+
+        weapon_lines = self._summarise_components(installed.get("weapons", []), include_dps=True)
+        missile_lines = self._summarise_components(installed.get("missiles", []), include_dps=False)
+        if missile_lines:
+            weapon_lines.extend(missile_lines)
+        if not weapon_lines:
+            weapon_lines.append("No named compatible weapons were exposed by the Wiki API for this hull.")
+
+        system_components = installed.get("shields", []) + installed.get("power", []) + installed.get("coolers", [])
+        system_lines = self._summarise_components(system_components, include_dps=False)
+        if not system_lines:
+            system_lines.append("No named system components were exposed by the Wiki API for this hull.")
+
+        perf_lines: list[str] = []
+        total_dps, total_alpha = self._weapon_totals(installed.get("weapons", []))
+        if total_dps is not None:
+            perf_lines.append(f"Estimated pilot / mounted weapon DPS: {_fmt_num(total_dps, 0)}")
+        if total_alpha is not None:
+            perf_lines.append(f"Estimated alpha strike per volley: {_fmt_num(total_alpha, 0)}")
+        if performance.get("hull_hp") is not None:
+            perf_lines.append(f"Hull HP: {_fmt_num(performance['hull_hp'], 0)}")
+        if performance.get("shield_hp") is not None:
+            perf_lines.append(f"Shield HP: {_fmt_num(performance['shield_hp'], 0)}")
+        if performance.get("scm_speed") is not None or performance.get("max_speed") is not None:
+            scm = _fmt_num(performance.get("scm_speed"), 0)
+            mx = _fmt_num(performance.get("max_speed"), 0)
+            perf_lines.append(f"Speed: SCM {scm} m/s • Max {mx} m/s")
+        if performance.get("cargo_scu") is not None:
+            perf_lines.append(f"Cargo: {_fmt_num(performance['cargo_scu'], 0)} SCU")
+        if performance.get("max_crew") is not None:
+            perf_lines.append(f"Crew: {_fmt_num(performance['max_crew'], 0)}")
+        if not perf_lines:
+            perf_lines.append("Performance stats were not exposed cleanly by the Wiki API for this hull.")
+
+        notes: list[str] = []
+        if manufacturer:
+            notes.append(f"Manufacturer: {manufacturer}")
+        if role:
+            notes.append(f"Role classification: {role}")
+        if hardpoints:
+            notes.extend(hardpoints)
+        if installed.get("weapons") and total_dps is not None:
+            notes.append("Weapon totals are calculated from the mounted / exposed Wiki component stats visible for this vehicle.")
+        else:
+            notes.append("This report is based only on data exposed by the Star Citizen Wiki API for this vehicle.")
+        notes.append("When the API exposes only installed components instead of every compatible option, the report reflects the strongest named setup visible from that data.")
+
+        return LoadoutReport(
+            ship_name=vehicle_name,
+            role=role,
+            manufacturer=manufacturer,
+            hardpoints=hardpoints,
+            weapons=weapon_lines,
+            systems=system_lines,
+            performance=perf_lines,
+            notes=notes,
+            raw=vehicle,
+        )
 
     async def get_hardpoints(self, ship_name: str) -> dict[str, list[dict[str, Any]]] | None:
-        """Return categorised hardpoint buckets for *ship_name*.
-
-        Returns a dict with keys ``weapons``, ``shields``, ``power``,
-        ``coolers``, ``missiles``, ``other``, or ``None`` if the ship cannot
-        be found or the API is unavailable.
-        """
-        ship_data = await self.get_ship(ship_name)
-        if ship_data is None:
+        vehicle = await self.get_ship(ship_name)
+        if not vehicle:
             return None
-        return self._extract_hardpoints(ship_data)
+        installed = self._extract_installed_components(vehicle)
+        result: dict[str, list[dict[str, Any]]] = {key: [] for key in ("weapons", "missiles", "shields", "power", "coolers", "other")}
+        for category, components in installed.items():
+            for component in components:
+                result.setdefault(category, []).append(
+                    {
+                        "name": component.name,
+                        "size": component.size,
+                        "item_class": component.item_class,
+                        "grade": component.grade,
+                        "dps": component.dps,
+                        "count": component.count,
+                    }
+                )
+        return result
 
     async def get_performance(self, ship_name: str) -> dict[str, Any] | None:
-        """Return a flat dict of performance metrics for *ship_name*.
-
-        Returns ``None`` if the ship cannot be found or the API is unavailable.
-        """
-        ship_data = await self.get_ship(ship_name)
-        if ship_data is None:
+        vehicle = await self.get_ship(ship_name)
+        if not vehicle:
             return None
-        return self._extract_performance(ship_data)
+        return self._extract_performance(vehicle)

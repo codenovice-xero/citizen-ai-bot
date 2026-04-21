@@ -58,6 +58,33 @@ class LoadoutSuggestion:
 
 
 @dataclass(slots=True)
+class LoadoutComponent:
+    name: str
+    category: str
+    size: str | None = None
+    item_class: str | None = None
+    grade: str | None = None
+    group: str | None = None
+    dps: float | None = None
+    alpha_damage: float | None = None
+    count: int = 1
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class LoadoutReport:
+    ship_name: str
+    role: str | None
+    manufacturer: str | None
+    hardpoints: list[str]
+    weapons: list[str]
+    systems: list[str]
+    performance: list[str]
+    notes: list[str]
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class MiningSuggestion:
     ship_name: str
     modules: list[str]
