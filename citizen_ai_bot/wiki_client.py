@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 _WIKI_API_BASE = "https://api.star-citizen.wiki"
 _CACHE_TTL = 60 * 30
 
-
 WEAPON_KEYWORDS = (
     "weapon",
     "gun",
@@ -66,6 +65,29 @@ ROLE_HINTS = {
     "dropship": "Dropship",
     "gunship": "Gunship",
     "ground": "Ground Vehicle",
+}
+
+# Common user-input aliases. Keep these conservative.
+SHIP_ALIASES = {
+    "anvil arrow": "Arrow",
+    "arrow": "Arrow",
+    "anvil gladius": "Gladius",
+    "aegis gladius": "Gladius",
+    "gladius": "Gladius",
+    "aegis sabre": "Sabre",
+    "sabre": "Sabre",
+    "sabrefirebird": "Sabre Firebird",
+    "sabre firebird": "Sabre Firebird",
+    "drake corsair": "Corsair",
+    "corsair": "Corsair",
+    "rsi shiv": "Shiv",
+    "shiv": "Shiv",
+    "rsi scorpius": "Scorpius",
+    "scorpius": "Scorpius",
+    "carrack": "Carrack",
+    "anvil carrack": "Carrack",
+    "vanguard": "Vanguard Warden",
+    "aegis vanguard": "Vanguard Warden",
 }
 
 
@@ -178,6 +200,36 @@ def _classify_from_text(text: str) -> str | None:
     return None
 
 
+def _clean_placeholder_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    bad_exact = {
+        "weapon",
+        "weapons",
+        "missile",
+        "missiles",
+        "shield generator",
+        "shield generators",
+        "power plant",
+        "power plants",
+        "cooler",
+        "coolers",
+        "tbd",
+        "unknown",
+    }
+    bad_prefixes = ("rsiweapon", "rsimodular", "rsi", "vehicleitem")
+    lowered = cleaned.lower().replace(" ", "")
+    if cleaned.lower() in bad_exact:
+        return None
+    if any(lowered.startswith(prefix) for prefix in bad_prefixes):
+        return None
+    return cleaned
+
+
 class WikiClient:
     def __init__(self, timeout: float = 20.0) -> None:
         self._http = httpx.AsyncClient(
@@ -186,24 +238,39 @@ class WikiClient:
             follow_redirects=True,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "CitizenAI-DiscordBot/0.4",
+                "User-Agent": "CitizenAI-DiscordBot/1.0",
             },
         )
         self._vehicle_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._search_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     async def close(self) -> None:
         await self._http.aclose()
 
     async def ping(self) -> bool:
-        try:
-            response = await self._http.get("/api/v3/vehicles/Gladius")
-            response.raise_for_status()
-            payload = response.json()
-            return isinstance(payload, dict) and bool(payload.get("data") or payload)
-        except Exception:
-            return False
+        probes = (
+            "/api/vehicles/Gladius",
+            "/api/v3/vehicles/Gladius",
+        )
+        for path in probes:
+            try:
+                response = await self._http.get(path)
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict) and (payload.get("data") or payload):
+                    return True
+            except Exception:
+                continue
+        return False
 
-    async def _get_json(self, path: str, *, params: dict[str, Any] | None = None, json: dict[str, Any] | None = None, method: str = "GET") -> Any:
+    async def _request_json(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        method: str = "GET",
+    ) -> Any:
         response = await self._http.request(method, path, params=params, json=json)
         response.raise_for_status()
         payload = response.json()
@@ -211,72 +278,184 @@ class WikiClient:
             return payload.get("data")
         return payload
 
+    async def _try_paths(
+        self,
+        paths: list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]],
+    ) -> Any | None:
+        last_error: Exception | None = None
+        for method, path, params, json in paths:
+            try:
+                data = await self._request_json(path, params=params, json=json, method=method)
+                if data is not None:
+                    return data
+            except Exception as exc:
+                last_error = exc
+                log.debug("Wiki request failed: %s %s (%s)", method, path, exc)
+        if last_error:
+            log.debug("All Wiki path attempts failed: %s", last_error)
+        return None
+
+    def _vehicle_detail_paths(self, identifier: str) -> list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]]:
+        include = {"include": "components,ports,shops"}
+        return [
+            ("GET", f"/api/vehicles/{identifier}", include, None),
+            ("GET", f"/api/v3/vehicles/{identifier}", include, None),
+        ]
+
     async def search_vehicle(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        data = await self._get_json(
-            "/api/v3/vehicles/search",
-            params={"limit": limit},
-            json={"query": query},
-            method="POST",
-        )
-        return [item for item in _as_list(data) if isinstance(item, dict)]
+        key = _norm(query)
+        if not key:
+            return []
+
+        now = time.monotonic()
+        cached = self._search_cache.get(key)
+        if cached and (now - cached[0]) < _CACHE_TTL:
+            return cached[1]
+
+        # Prefer the non-deprecated collection/search style first.
+        attempts: list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]] = [
+            ("GET", "/api/vehicles", {"search": query, "limit": limit}, None),
+            ("GET", "/api/v3/vehicles", {"search": query, "limit": limit}, None),
+            # Deprecated fallback kept on purpose for resilience.
+            ("POST", "/api/vehicles/search", {"limit": limit}, {"query": query}),
+            ("POST", "/api/v3/vehicles/search", {"limit": limit}, {"query": query}),
+        ]
+
+        results: list[dict[str, Any]] = []
+        for method, path, params, json in attempts:
+            try:
+                data = await self._request_json(path, params=params, json=json, method=method)
+                if isinstance(data, list):
+                    results = [x for x in data if isinstance(x, dict)]
+                elif isinstance(data, dict):
+                    results = [x for x in _as_list(data.get("data") or data.get("items") or data.get("results")) if isinstance(x, dict)]
+                if results:
+                    break
+            except Exception as exc:
+                log.debug("Vehicle search attempt failed: %s %s (%s)", method, path, exc)
+
+        # Last-resort client-side fallback: broad fetch without search if supported.
+        if not results:
+            for path in ("/api/vehicles", "/api/v3/vehicles"):
+                try:
+                    data = await self._request_json(path, params={"limit": 250}, method="GET")
+                    pool = [x for x in _as_list(data) if isinstance(x, dict)]
+                    if pool:
+                        results = self._rank_vehicle_candidates(query, pool)[:limit]
+                        break
+                except Exception as exc:
+                    log.debug("Vehicle list fallback failed: %s (%s)", path, exc)
+
+        self._search_cache[key] = (now, results)
+        return results
+
+    def _vehicle_candidate_names(self, candidate: dict[str, Any]) -> list[str]:
+        names: list[str] = []
+        for key in ("name", "name_full", "slug", "uuid", "title"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                names.append(value.strip())
+        manufacturer = candidate.get("manufacturer")
+        if isinstance(manufacturer, dict):
+            mname = _manufacturer_name(manufacturer)
+            if mname and names:
+                names.append(f"{mname} {names[0]}")
+        return names
+
+    def _rank_vehicle_candidates(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for candidate in candidates:
+            names = self._vehicle_candidate_names(candidate)
+            if not names:
+                continue
+            score = max(fuzzy_score(query, name) for name in names)
+            norm_query = _norm(query)
+            norm_names = {_norm(name) for name in names}
+            slug_names = {_slug(name) for name in names}
+            if norm_query in norm_names or _slug(norm_query) in slug_names:
+                score += 25
+            scored.append((score, candidate))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [candidate for _, candidate in scored]
 
     def _pick_best_vehicle_match(self, query: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-        best: tuple[float, dict[str, Any]] | None = None
-        for candidate in candidates:
-            names = [
-                candidate.get("name"),
-                candidate.get("name_full"),
-                candidate.get("slug"),
-                candidate.get("uuid"),
-            ]
-            score = max(fuzzy_score(query, str(name)) for name in names if name)
-            if best is None or score > best[0]:
-                best = (score, candidate)
-        return best[1] if best else None
+        ranked = self._rank_vehicle_candidates(query, candidates)
+        return ranked[0] if ranked else None
+
+    def _vehicle_lookup_candidates(self, ship_name: str) -> list[str]:
+        raw = ship_name.strip()
+        norm = _norm(raw)
+        alias = SHIP_ALIASES.get(norm)
+
+        candidates: list[str] = []
+        for value in (
+            alias,
+            raw,
+            raw.replace("-", " "),
+            _slug(raw),
+            raw.title(),
+        ):
+            if value and value not in candidates:
+                candidates.append(value)
+
+        # Strip likely manufacturer prefix.
+        tokens = raw.split()
+        if len(tokens) > 1:
+            stripped = " ".join(tokens[1:])
+            if stripped and stripped not in candidates:
+                candidates.append(stripped)
+                candidates.append(_slug(stripped))
+
+        # URL-safe forms.
+        out: list[str] = []
+        for value in candidates:
+            if value and value not in out:
+                out.append(value)
+            enc = quote(value) if value else ""
+            if enc and enc not in out:
+                out.append(enc)
+        return out
 
     async def _fetch_vehicle(self, ship_name: str) -> dict[str, Any] | None:
-        includes = "components,ports,shops"
-        candidates = [ship_name, _slug(ship_name), quote(ship_name), quote(_slug(ship_name))]
-        seen: set[str] = set()
-        for candidate in candidates:
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            try:
-                data = await self._get_json(f"/api/v3/vehicles/{candidate}", params={"include": includes})
-                if isinstance(data, dict) and data:
-                    return data
-            except Exception:
-                continue
+        for candidate in self._vehicle_lookup_candidates(ship_name):
+            data = await self._try_paths(self._vehicle_detail_paths(candidate))
+            if isinstance(data, dict) and data:
+                return data
 
-        try:
-            matches = await self.search_vehicle(ship_name)
-        except Exception as exc:
-            log.warning("Vehicle search failed for %r: %s", ship_name, exc)
-            return None
-
+        matches = await self.search_vehicle(ship_name)
         match = self._pick_best_vehicle_match(ship_name, matches)
         if not match:
+            log.warning("No vehicle match found for %r", ship_name)
             return None
 
-        target = _first_non_empty(match.get("name"), match.get("name_full"), match.get("slug"))
+        target = _first_non_empty(
+            match.get("slug"),
+            match.get("name"),
+            match.get("name_full"),
+            match.get("uuid"),
+            match.get("title"),
+        )
         if not isinstance(target, str):
+            log.warning("Vehicle search match for %r had no usable identifier", ship_name)
             return None
 
-        try:
-            data = await self._get_json(f"/api/v3/vehicles/{quote(target)}", params={"include": includes})
-            return data if isinstance(data, dict) and data else None
-        except Exception:
-            return None
+        data = await self._try_paths(self._vehicle_detail_paths(quote(target)))
+        if isinstance(data, dict) and data:
+            return data
+
+        log.warning("Vehicle detail lookup failed after search match for %r using %r", ship_name, target)
+        return None
 
     async def get_ship(self, ship_name: str) -> dict[str, Any] | None:
         key = _norm(ship_name)
         if not key:
             return None
+
         now = time.monotonic()
         cached = self._vehicle_cache.get(key)
         if cached and (now - cached[0]) < _CACHE_TTL:
             return cached[1]
+
         data = await self._fetch_vehicle(ship_name)
         if data:
             self._vehicle_cache[key] = (now, data)
@@ -298,11 +477,13 @@ class WikiClient:
                 text_chunks.extend(str(item) for item in candidate if item)
             elif candidate:
                 text_chunks.append(str(candidate))
+
         for chunk in text_chunks:
             lowered = chunk.lower()
             for key, label in ROLE_HINTS.items():
                 if key in lowered:
                     return label
+
         return _titleize(str(text_chunks[0])) if text_chunks else None
 
     def _extract_manufacturer(self, vehicle: dict[str, Any]) -> str | None:
@@ -317,11 +498,28 @@ class WikiClient:
     def _extract_performance(self, vehicle: dict[str, Any]) -> dict[str, Any]:
         speed = vehicle.get("speed") or {}
         crew = vehicle.get("crew") or {}
+        hull_hp = _to_float(
+            _first_non_empty(
+                vehicle.get("health"),
+                vehicle.get("hull_hp"),
+                vehicle.get("hit_points"),
+                vehicle.get("hp"),
+            )
+        )
+        shield_hp = _to_float(
+            _first_non_empty(
+                vehicle.get("shield_hp"),
+                vehicle.get("shields_hp"),
+                vehicle.get("shield_health"),
+                (vehicle.get("shield") or {}).get("health") if isinstance(vehicle.get("shield"), dict) else None,
+            )
+        )
+
         return {
             "scm_speed": _to_float(speed.get("scm") if isinstance(speed, dict) else None),
             "max_speed": _to_float(speed.get("max") if isinstance(speed, dict) else None),
-            "hull_hp": _to_float(_first_non_empty(vehicle.get("health"), vehicle.get("hull_hp"), vehicle.get("hit_points"))),
-            "shield_hp": _to_float(_first_non_empty(vehicle.get("shield_hp"), vehicle.get("shields_hp"), vehicle.get("shield_health"))),
+            "hull_hp": hull_hp,
+            "shield_hp": shield_hp,
             "cargo_scu": _to_float(_first_non_empty(vehicle.get("cargo_capacity"), vehicle.get("cargo"), vehicle.get("cargo_scu"))),
             "max_crew": _to_int(crew.get("max") if isinstance(crew, dict) else crew),
         }
@@ -376,14 +574,25 @@ class WikiClient:
         for nested_key in ("item", "component", "mounted_item", "equipped_item", "details", "specs", "weapon_data"):
             nested = obj.get(nested_key)
             if isinstance(nested, dict):
-                nested_candidates.append(_first_non_empty(nested.get("name"), nested.get("name_full"), nested.get("label")))
-        value = _first_non_empty(obj.get("name"), obj.get("name_full"), obj.get("label"), *nested_candidates)
+                nested_candidates.append(
+                    _first_non_empty(
+                        nested.get("name"),
+                        nested.get("name_full"),
+                        nested.get("label"),
+                        nested.get("title"),
+                    )
+                )
+
+        value = _first_non_empty(
+            obj.get("name"),
+            obj.get("name_full"),
+            obj.get("label"),
+            obj.get("title"),
+            *nested_candidates,
+        )
         if not isinstance(value, str):
             return None
-        cleaned = value.strip()
-        if not cleaned or cleaned.lower() in {"weapon", "weapons", "missile", "missiles", "shield generators", "power plants", "coolers"}:
-            return None
-        return cleaned
+        return _clean_placeholder_name(value)
 
     def _extract_item_class(self, obj: dict[str, Any]) -> tuple[str | None, str | None]:
         family_candidates = [
@@ -401,13 +610,21 @@ class WikiClient:
             (obj.get("details") or {}).get("grade") if isinstance(obj.get("details"), dict) else None,
         ]
 
-        family = _titleize(str(_first_non_empty(*family_candidates))) if _first_non_empty(*family_candidates) else None
+        family_raw = _first_non_empty(*family_candidates)
         grade_raw = _first_non_empty(*grade_candidates)
+
+        family = None
+        if family_raw is not None:
+            family_text = str(family_raw).strip()
+            if family_text and not family_text.upper().startswith("RSI"):
+                family = _titleize(family_text)
+
         grade = None
         if grade_raw is not None:
             grade_text = str(grade_raw).strip().upper()
-            if grade_text and not grade_text.startswith("RSI"):
+            if grade_text and not grade_text.startswith("RSI") and grade_text != "TBD":
                 grade = grade_text
+
         return family, grade
 
     def _extract_dps(self, obj: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -424,6 +641,7 @@ class WikiClient:
             "burst_damage",
             "vehicle_weapon_alpha",
         )
+
         for key in direct_dps_keys:
             value = _to_float(obj.get(key))
             if value is not None:
@@ -434,7 +652,17 @@ class WikiClient:
                         break
                 return value, alpha
 
-        nested_dicts = [nested for nested in (obj.get("weapon_data"), obj.get("specs"), obj.get("details"), obj.get("item"), obj.get("component")) if isinstance(nested, dict)]
+        nested_dicts = [
+            nested
+            for nested in (
+                obj.get("weapon_data"),
+                obj.get("specs"),
+                obj.get("details"),
+                obj.get("item"),
+                obj.get("component"),
+            )
+            if isinstance(nested, dict)
+        ]
         for nested in nested_dicts:
             dps, alpha = self._extract_dps(nested)
             if dps is not None or alpha is not None:
@@ -446,10 +674,20 @@ class WikiClient:
             damage_total = sum(_to_float(v) or 0.0 for v in damage.values())
             if damage_total == 0:
                 damage_total = None
-        rpm = _to_float(_first_non_empty(obj.get("rpm"), obj.get("fire_rate"), obj.get("rate_of_fire"), (obj.get("weapon_data") or {}).get("rpm") if isinstance(obj.get("weapon_data"), dict) else None))
+
+        rpm = _to_float(
+            _first_non_empty(
+                obj.get("rpm"),
+                obj.get("fire_rate"),
+                obj.get("rate_of_fire"),
+                (obj.get("weapon_data") or {}).get("rpm") if isinstance(obj.get("weapon_data"), dict) else None,
+            )
+        )
+
         if damage_total is not None:
             dps = damage_total * (rpm / 60.0) if rpm else None
             return dps, damage_total
+
         return None, None
 
     def _extract_count(self, obj: dict[str, Any]) -> int:
@@ -463,7 +701,7 @@ class WikiClient:
         category = _classify_from_text(self._candidate_text(obj))
         if category:
             return category
-        name = _extract_item_name(obj)
+        name = self._extract_item_name(obj)
         if name:
             return _classify_from_text(name)
         return None
@@ -472,10 +710,12 @@ class WikiClient:
         category = category_override or self._classify_component(obj)
         if not category:
             return None
+
         name = self._extract_item_name(obj) or CATEGORY_LABELS.get(category, "Component")
         size = self._extract_size(obj)
         item_class, grade = self._extract_item_class(obj)
         dps, alpha = self._extract_dps(obj)
+
         return LoadoutComponent(
             name=name,
             category=category,
@@ -491,12 +731,13 @@ class WikiClient:
 
     def _extract_installed_components(self, vehicle: dict[str, Any]) -> dict[str, list[LoadoutComponent]]:
         grouped: dict[str, list[LoadoutComponent]] = defaultdict(list)
+
         for obj in self._extract_components_root(vehicle):
             component = self._component_from_obj(obj)
             if component:
                 grouped[component.category].append(component)
 
-        # Some APIs only expose equipped items inside ports.
+        # Fallback: some vehicles only expose mounted items inside ports.
         if not grouped:
             for port in self._extract_port_records(vehicle):
                 category = self._classify_component(port)
@@ -526,7 +767,8 @@ class WikiClient:
             if category not in counts:
                 continue
             size_label = self._extract_size(port) or "?"
-            counts[category][size_label] += 0 if counts[category][size_label] else 1
+            if counts[category][size_label] == 0:
+                counts[category][size_label] += 1
 
         lines: list[str] = []
         for category in ("weapons", "missiles", "shields", "power", "coolers"):
@@ -539,6 +781,7 @@ class WikiClient:
 
     def _summarise_components(self, components: list[LoadoutComponent], *, include_dps: bool = False) -> list[str]:
         grouped: dict[tuple[str, str | None, str | None, str | None, float | None, float | None], int] = defaultdict(int)
+
         for component in components:
             grouped[(component.name, component.size, component.item_class, component.grade, component.dps, component.alpha_damage)] += component.count
 
@@ -574,6 +817,7 @@ class WikiClient:
         total_alpha = 0.0
         any_dps = False
         any_alpha = False
+
         for weapon in weapons:
             if weapon.dps is not None:
                 total_dps += weapon.dps * max(1, weapon.count)
@@ -581,6 +825,7 @@ class WikiClient:
             if weapon.alpha_damage is not None:
                 total_alpha += weapon.alpha_damage * max(1, weapon.count)
                 any_alpha = True
+
         return (total_dps if any_dps else None, total_alpha if any_alpha else None)
 
     async def build_loadout_report(self, ship_name: str) -> LoadoutReport | None:
@@ -588,7 +833,7 @@ class WikiClient:
         if vehicle is None:
             return None
 
-        vehicle_name = _first_non_empty(vehicle.get("name"), vehicle.get("name_full"), ship_name)
+        vehicle_name = _first_non_empty(vehicle.get("name"), vehicle.get("name_full"), vehicle.get("title"), ship_name)
         if not isinstance(vehicle_name, str):
             vehicle_name = ship_name
 
@@ -612,6 +857,7 @@ class WikiClient:
 
         perf_lines: list[str] = []
         total_dps, total_alpha = self._weapon_totals(installed.get("weapons", []))
+
         if total_dps is not None:
             perf_lines.append(f"Estimated pilot / mounted weapon DPS: {_fmt_num(total_dps, 0)}")
         if total_alpha is not None:
@@ -628,6 +874,7 @@ class WikiClient:
             perf_lines.append(f"Cargo: {_fmt_num(performance['cargo_scu'], 0)} SCU")
         if performance.get("max_crew") is not None:
             perf_lines.append(f"Crew: {_fmt_num(performance['max_crew'], 0)}")
+
         if not perf_lines:
             perf_lines.append("Performance stats were not exposed cleanly by the Wiki API for this hull.")
 
@@ -660,8 +907,12 @@ class WikiClient:
         vehicle = await self.get_ship(ship_name)
         if not vehicle:
             return None
+
         installed = self._extract_installed_components(vehicle)
-        result: dict[str, list[dict[str, Any]]] = {key: [] for key in ("weapons", "missiles", "shields", "power", "coolers", "other")}
+        result: dict[str, list[dict[str, Any]]] = {
+            key: [] for key in ("weapons", "missiles", "shields", "power", "coolers", "other")
+        }
+
         for category, components in installed.items():
             for component in components:
                 result.setdefault(category, []).append(
@@ -674,6 +925,7 @@ class WikiClient:
                         "count": component.count,
                     }
                 )
+
         return result
 
     async def get_performance(self, ship_name: str) -> dict[str, Any] | None:
