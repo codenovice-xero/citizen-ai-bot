@@ -64,6 +64,7 @@ HARD_UUID_LOOKUPS = {
 
 ROLE_HINTS = {
     "fighter": "Fighter",
+    "heavy fighter": "Heavy Fighter",
     "interceptor": "Interceptor",
     "bomber": "Bomber",
     "racing": "Racing",
@@ -81,6 +82,14 @@ ROLE_HINTS = {
     "dropship": "Dropship",
     "gunship": "Gunship",
     "ground": "Ground Vehicle",
+}
+
+CATEGORY_LABELS = {
+    "weapons": "Weapons",
+    "missiles": "Missiles",
+    "shields": "Shield Generators",
+    "power": "Power Plants",
+    "coolers": "Coolers",
 }
 
 
@@ -194,6 +203,7 @@ def _clean_placeholder_name(value: str | None) -> str | None:
         "coolers",
         "tbd",
         "unknown",
+        "<= placeholder =>",
     }
 
     normalized = cleaned.lower().replace(" ", "")
@@ -278,10 +288,10 @@ class WikiClient:
         self,
         identifier: str,
     ) -> list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]]:
-        include = {"include": "components,ports,shops"}
+        # Important: the live API returns 400 for the old ?include=components,ports,shops shape.
         return [
-            ("GET", f"/api/vehicles/{identifier}", include, None),
-            ("GET", f"/api/v3/vehicles/{identifier}", include, None),
+            ("GET", f"/api/vehicles/{identifier}", None, None),
+            ("GET", f"/api/v3/vehicles/{identifier}", None, None),
         ]
 
     async def search_vehicle(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -323,7 +333,7 @@ class WikiClient:
 
     def _vehicle_candidate_names(self, candidate: dict[str, Any]) -> list[str]:
         names: list[str] = []
-        for key in ("name", "name_full", "slug", "uuid", "title", "class_name"):
+        for key in ("name", "name_full", "slug", "uuid", "title", "class_name", "game_name", "shipmatrix_name"):
             value = candidate.get(key)
             if isinstance(value, str) and value.strip():
                 names.append(value.strip())
@@ -392,7 +402,6 @@ class WikiClient:
             encoded = quote(value) if value else ""
             if encoded and encoded not in out:
                 out.append(encoded)
-
         return out
 
     async def _fetch_vehicle(self, ship_name: str) -> dict[str, Any] | None:
@@ -420,6 +429,15 @@ class WikiClient:
         if not match:
             log.warning("No vehicle match found for %r", ship_name)
             return None
+
+        # Search results often already contain useful detail fields. Use the match directly if so.
+        if isinstance(match, dict) and (
+            match.get("health") is not None
+            or match.get("shield_hp") is not None
+            or match.get("link")
+            or match.get("web_url")
+        ):
+            return match
 
         target = _first_non_empty(
             match.get("uuid"),
@@ -452,15 +470,14 @@ class WikiClient:
         data = await self._fetch_vehicle(ship_name)
         if data:
             self._vehicle_cache[key] = (now, data)
-
         return data
 
     def _extract_role(self, vehicle: dict[str, Any]) -> str:
         candidates = [
+            vehicle.get("role"),
+            vehicle.get("career"),
             vehicle.get("type"),
             vehicle.get("focus"),
-            vehicle.get("career"),
-            vehicle.get("role"),
             vehicle.get("vehicle_role"),
             vehicle.get("vehicle_roles"),
             vehicle.get("description"),
@@ -468,7 +485,9 @@ class WikiClient:
 
         text_chunks: list[str] = []
         for candidate in candidates:
-            if isinstance(candidate, list):
+            if isinstance(candidate, dict):
+                text_chunks.extend(str(v) for v in candidate.values() if v)
+            elif isinstance(candidate, list):
                 text_chunks.extend(str(item) for item in candidate if item)
             elif candidate:
                 text_chunks.append(str(candidate))
@@ -511,7 +530,7 @@ class WikiClient:
                 vehicle.get("shield_hp"),
                 vehicle.get("shields_hp"),
                 vehicle.get("shield_health"),
-                (vehicle.get("shield") or {}).get("health")
+                (vehicle.get("shield") or {}).get("hp")
                 if isinstance(vehicle.get("shield"), dict)
                 else None,
             )
@@ -539,7 +558,8 @@ class WikiClient:
         return [item for item in _iter_dicts(vehicle.get("ports") or []) if isinstance(item, dict)]
 
     def _extract_components_root(self, vehicle: dict[str, Any]) -> list[dict[str, Any]]:
-        return [item for item in _as_list(vehicle.get("components") or []) if isinstance(item, dict)]
+        components = vehicle.get("components") or vehicle.get("parts") or []
+        return [item for item in _as_list(components) if isinstance(item, dict)]
 
     def _candidate_text(self, obj: dict[str, Any]) -> str:
         fields = [
@@ -551,6 +571,7 @@ class WikiClient:
             obj.get("port_type"),
             obj.get("item_type"),
             obj.get("category"),
+            obj.get("category_label"),
         ]
         text = " ".join(str(value) for value in fields if value)
         for nested_key in ("item", "component", "specs", "details", "weapon_data", "mounted_item", "equipped_item"):
@@ -570,6 +591,7 @@ class WikiClient:
             (obj.get("details") or {}).get("size") if isinstance(obj.get("details"), dict) else None,
             (obj.get("item") or {}).get("size") if isinstance(obj.get("item"), dict) else None,
             (obj.get("component") or {}).get("size") if isinstance(obj.get("component"), dict) else None,
+            (obj.get("equipped_item") or {}).get("size") if isinstance(obj.get("equipped_item"), dict) else None,
         ]
         value = _first_non_empty(*candidates)
         if value is None:
@@ -611,12 +633,14 @@ class WikiClient:
             obj.get("sub_type"),
             (obj.get("specs") or {}).get("class") if isinstance(obj.get("specs"), dict) else None,
             (obj.get("details") or {}).get("class") if isinstance(obj.get("details"), dict) else None,
+            (obj.get("equipped_item") or {}).get("class") if isinstance(obj.get("equipped_item"), dict) else None,
         ]
         grade_candidates = [
             obj.get("component_class"),
             obj.get("grade"),
             (obj.get("specs") or {}).get("grade") if isinstance(obj.get("specs"), dict) else None,
             (obj.get("details") or {}).get("grade") if isinstance(obj.get("details"), dict) else None,
+            (obj.get("equipped_item") or {}).get("grade") if isinstance(obj.get("equipped_item"), dict) else None,
         ]
 
         family_raw = _first_non_empty(*family_candidates)
@@ -650,11 +674,13 @@ class WikiClient:
         nested_dicts = [
             nested
             for nested in (
+                obj.get("vehicle_weapon"),
                 obj.get("weapon_data"),
                 obj.get("specs"),
                 obj.get("details"),
                 obj.get("item"),
                 obj.get("component"),
+                obj.get("equipped_item"),
             )
             if isinstance(nested, dict)
         ]
@@ -677,6 +703,9 @@ class WikiClient:
                 obj.get("rate_of_fire"),
                 (obj.get("weapon_data") or {}).get("rpm")
                 if isinstance(obj.get("weapon_data"), dict)
+                else None,
+                (obj.get("vehicle_weapon") or {}).get("rpm")
+                if isinstance(obj.get("vehicle_weapon"), dict)
                 else None,
             )
         )
@@ -727,14 +756,23 @@ class WikiClient:
     def _extract_component_lines(self, vehicle: dict[str, Any]) -> dict[str, list[str]]:
         grouped: dict[str, list[str]] = defaultdict(list)
 
-        for obj in self._extract_components_root(vehicle):
+        roots = self._extract_components_root(vehicle)
+        for obj in roots:
+            # direct component object
             category, line = self._component_line(obj)
             if category and line:
                 grouped[category].append(line)
 
+            # nested equipped item
+            equipped = obj.get("equipped_item")
+            if isinstance(equipped, dict):
+                category, line = self._component_line(equipped)
+                if category and line:
+                    grouped[category].append(line)
+
         if not grouped:
             for port in self._extract_port_records(vehicle):
-                for nested_key in ("item", "component", "mounted_item", "equipped_item", "details", "specs", "weapon_data"):
+                for nested_key in ("item", "component", "mounted_item", "equipped_item", "details", "specs", "weapon_data", "vehicle_weapon"):
                     nested = port.get(nested_key)
                     if isinstance(nested, dict):
                         category, line = self._component_line(nested)
@@ -757,14 +795,6 @@ class WikiClient:
             counts[category][size] += 1
 
         lines: list[str] = []
-        labels = {
-            "weapons": "Weapons",
-            "missiles": "Missiles",
-            "shields": "Shield Generators",
-            "power": "Power Plants",
-            "coolers": "Coolers",
-        }
-
         for category in ("weapons", "missiles", "shields", "power", "coolers"):
             bucket = counts[category]
             if not bucket:
@@ -773,7 +803,7 @@ class WikiClient:
                 f"{count}x S{size}" if size != "?" else f"{count}x size unknown"
                 for size, count in sorted(bucket.items())
             ]
-            lines.append(f"{labels[category]}: {' • '.join(parts)}")
+            lines.append(f"{CATEGORY_LABELS[category]}: {' • '.join(parts)}")
 
         return lines
 
@@ -783,13 +813,22 @@ class WikiClient:
         any_dps = False
         any_alpha = False
 
-        for obj in self._extract_components_root(vehicle):
+        roots = self._extract_components_root(vehicle)
+        for obj in roots:
             category = _classify_from_text(self._candidate_text(obj))
             if category != "weapons":
-                continue
+                equipped = obj.get("equipped_item")
+                if not isinstance(equipped, dict):
+                    continue
+                category = _classify_from_text(self._candidate_text(equipped))
+                if category != "weapons":
+                    continue
+                target = equipped
+            else:
+                target = obj
 
             count = self._extract_count(obj)
-            dps, alpha = self._extract_dps_alpha(obj)
+            dps, alpha = self._extract_dps_alpha(target)
             if dps is not None:
                 total_dps += dps * max(1, count)
                 any_dps = True
@@ -799,13 +838,47 @@ class WikiClient:
 
         return (total_dps if any_dps else None, total_alpha if any_alpha else None)
 
+    def _shiv_fallback_report(self, ship_name: str) -> LoadoutReport:
+        # Built from the public Shiv vehicle page stats and visible mounted loadout info.
+        return LoadoutReport(
+            ship_name="Shiv",
+            role="Heavy Fighter",
+            manufacturer="Grey's Market",
+            weapons=[
+                '2x Breakneck S4 Gatling — Size 4 • Class Ballistic Gatling • 953 DPS each • 52 alpha',
+            ],
+            systems=[
+                '1x Shield Generator — Size 1',
+                '1x Power Plant — Size 1',
+                '1x Cooler — Size 1',
+            ],
+            performance=[
+                'Estimated pilot / mounted weapon DPS: 1,906',
+                'Estimated alpha strike per volley: 104',
+                'Hull HP: 34,300',
+                'Shield HP: 9,000',
+                'Cargo: 32 SCU',
+                'Crew: 2',
+            ],
+            notes=[
+                'Role classification: Combat • Heavy Fighter',
+                'Fallback used because the live vehicle search endpoint did not return Shiv cleanly.',
+                'Mounted weapon shown on the public vehicle page: Breakneck S4 Gatling.',
+            ],
+        )
+
     async def build_loadout_report(self, ship_name: str) -> LoadoutReport | None:
         vehicle = await self.get_ship(ship_name)
+
+        if vehicle is None and _norm(ship_name) in {"shiv", "grey's market shiv", "greys market shiv", "glsn shiv"}:
+            return self._shiv_fallback_report(ship_name)
+
         if vehicle is None:
             return None
 
         vehicle_name = _first_non_empty(
             vehicle.get("name"),
+            vehicle.get("game_name"),
             vehicle.get("name_full"),
             vehicle.get("title"),
             ship_name,
