@@ -23,10 +23,15 @@ class StarCitizenCog(commands.Cog):
         await interaction.response.send_message(embed=status_embed(status))
 
     @app_commands.command(name="item", description="Find item sale / buy data.")
-    async def item(self, interaction: discord.Interaction, name: str) -> None:
+    async def item(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        location: str | None = None,
+    ) -> None:
         await interaction.response.defer()
-        rows = await self.service.get_item_locations(name)
-        await interaction.followup.send(embed=item_embed(name, rows))
+        rows = await self.service.get_item_locations(name, location=location)
+        await interaction.followup.send(embed=item_embed(name, rows, location=location))
 
     @app_commands.command(name="route", description="Quick trade route guidance.")
     async def route(self, interaction: discord.Interaction, commodity: str) -> None:
