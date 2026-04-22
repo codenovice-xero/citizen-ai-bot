@@ -31,7 +31,8 @@ class StarCitizenCog(commands.Cog):
     ) -> None:
         await interaction.response.defer()
         rows = await self.service.get_item_locations(name, location=location)
-        await interaction.followup.send(embed=item_embed(name, rows, location=location))
+        resolved_location = rows[0].get("_resolved_location") if rows else None
+        await interaction.followup.send(embed=item_embed(name, rows, location=location, resolved_location=resolved_location))
 
     @app_commands.command(name="route", description="Quick trade route guidance.")
     async def route(self, interaction: discord.Interaction, commodity: str) -> None:
