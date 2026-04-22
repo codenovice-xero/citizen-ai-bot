@@ -45,8 +45,8 @@ class StarCitizenService:
             "overall": uex_ok or wiki_ok,
         }
 
-    async def get_item_locations(self, name: str) -> list[dict[str, Any]]:
-        return await self.client.get_item_locations(name)
+    async def get_item_locations(self, name: str, location: str | None = None) -> list[dict[str, Any]]:
+        return await self.client.get_item_locations(name, location=location)
 
     async def suggest_trade_route(self, commodity: str) -> str:
         rows = await self.client.price_snapshot(commodity)
