@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -13,10 +14,21 @@ log = logging.getLogger(__name__)
 
 _CACHE_TTL = 60 * 60 * 12  # 12 hours
 
-ITEM_ALIASES = {
-    "chaos iii": "khaos",
-    "chaos 3": "khaos",
-}
+
+def _normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace("-", " ")
+    text = re.sub(r"\biii\b", "3", text)
+    text = re.sub(r"\bii\b", "2", text)
+    text = re.sub(r"\biv\b", "4", text)
+    text = re.sub(r"\bv\b", "5", text)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = " ".join(text.split())
+    return text
+
+
+def _compact_text(text: str) -> str:
+    return _normalize_text(text).replace(" ", "")
 
 
 class UEXClient:
@@ -89,7 +101,8 @@ class UEXClient:
 
     def _pick_best_item(self, query: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:
         ranked: list[tuple[float, dict[str, Any]]] = []
-        query_norm = " ".join(query.lower().split())
+        query_norm = _normalize_text(query)
+        query_compact = _compact_text(query)
 
         for item in items:
             names = [
@@ -101,17 +114,22 @@ class UEXClient:
                 item.get("company_name"),
             ]
             names = [str(x) for x in names if x]
-
             if not names:
                 continue
 
             score = max(fuzzy_score(query, name) for name in names)
-            lowered_names = [name.lower() for name in names]
 
-            if any(query_norm == name for name in lowered_names):
-                score += 40
-            if any(query_norm in name for name in lowered_names):
+            norm_names = [_normalize_text(name) for name in names]
+            compact_names = [_compact_text(name) for name in names]
+
+            if any(query_norm == n for n in norm_names):
+                score += 45
+            if any(query_norm in n for n in norm_names):
                 score += 20
+            if any(query_compact == n for n in compact_names):
+                score += 35
+            if any(query_compact in n for n in compact_names):
+                score += 15
 
             ranked.append((score, item))
 
@@ -122,7 +140,7 @@ class UEXClient:
         best_score, best_item = ranked[0]
         best_name = str(best_item.get("name", ""))
 
-        if best_score < 55:
+        if best_score < 50:
             log.warning(
                 "Rejected weak UEX item match for %r: %r (score=%s)",
                 query,
@@ -131,23 +149,39 @@ class UEXClient:
             )
             return None
 
-        log.info("Resolved UEX item %r -> %r (id=%r)", query, best_name, best_item.get("id"))
+        log.info("Resolved UEX item %r -> %r (id=%r, score=%s)", query, best_name, best_item.get("id"), best_score)
         return best_item
 
     async def resolve_item(self, name: str) -> dict[str, Any] | None:
-        query = " ".join(name.lower().split())
-        alias = ITEM_ALIASES.get(query, name)
-
         items = await self._load_items_index()
-        return self._pick_best_item(alias, items)
+        return self._pick_best_item(name, items)
 
     async def resolve_terminal(self, location: str) -> dict[str, Any] | None:
+        query = _normalize_text(location)
+
+        terminal_aliases = {
+            "orison": "Seraphim",
+            "seraphim": "Seraphim",
+            "area18": "Area 18",
+            "area 18": "Area 18",
+            "new babbage": "New Babbage",
+            "nb": "New Babbage",
+            "lorville": "Lorville",
+            "everus": "Everus Harbor",
+            "everus harbor": "Everus Harbor",
+            "port tressler": "Port Tressler",
+            "tressler": "Port Tressler",
+            "grimhex": "GrimHEX",
+            "grim hex": "GrimHEX",
+        }
+
+        search_term = terminal_aliases.get(query, location)
         candidates: list[dict[str, Any]] = []
 
         for params in (
-            {"name": location},
-            {"fullname": location},
-            {"displayname": location},
+            {"name": search_term},
+            {"fullname": search_term},
+            {"displayname": search_term},
         ):
             try:
                 data = await self._get("/terminals", params=params)
@@ -160,6 +194,9 @@ class UEXClient:
             return None
 
         ranked: list[tuple[float, dict[str, Any]]] = []
+        search_norm = _normalize_text(search_term)
+        search_compact = _compact_text(search_term)
+
         for terminal in candidates:
             names = [
                 terminal.get("name"),
@@ -167,12 +204,27 @@ class UEXClient:
                 terminal.get("displayname"),
                 terminal.get("nickname"),
                 terminal.get("code"),
+                terminal.get("city_name"),
+                terminal.get("planet_name"),
             ]
             names = [str(x) for x in names if x]
             if not names:
                 continue
 
-            score = max(fuzzy_score(location, name) for name in names)
+            score = max(fuzzy_score(search_term, name) for name in names)
+
+            norm_names = [_normalize_text(n) for n in names]
+            compact_names = [_compact_text(n) for n in names]
+
+            if any(search_norm == n for n in norm_names):
+                score += 50
+            if any(search_norm in n for n in norm_names):
+                score += 20
+            if any(search_compact == n for n in compact_names):
+                score += 40
+            if any(search_compact in n for n in compact_names):
+                score += 15
+
             ranked.append((score, terminal))
 
         if not ranked:
@@ -180,6 +232,7 @@ class UEXClient:
 
         ranked.sort(key=lambda x: x[0], reverse=True)
         best_score, best_terminal = ranked[0]
+
         log.info(
             "Resolved terminal %r -> %r (id=%r, score=%s)",
             location,
@@ -275,6 +328,12 @@ class UEXClient:
         if origin_terminal_id is None:
             return deduped
 
+        resolved_location_name = (
+            origin_terminal.get("displayname")
+            or origin_terminal.get("fullname")
+            or origin_terminal.get("name")
+        )
+
         distance_map = await self.get_terminal_distances(int(origin_terminal_id))
 
         for row in deduped:
@@ -283,6 +342,7 @@ class UEXClient:
                 row["_distance_gm"] = distance_map.get(int(terminal_id)) if terminal_id is not None else None
             except Exception:
                 row["_distance_gm"] = None
+            row["_resolved_location"] = resolved_location_name
 
         deduped.sort(
             key=lambda row: (
