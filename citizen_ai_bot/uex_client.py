@@ -141,7 +141,84 @@ class UEXClient:
         items = await self._load_items_index()
         return self._pick_best_item(alias, items)
 
-    async def get_item_locations(self, name: str) -> list[dict[str, Any]]:
+    async def resolve_terminal(self, location: str) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+
+        for params in (
+            {"name": location},
+            {"fullname": location},
+            {"displayname": location},
+        ):
+            try:
+                data = await self._get("/terminals", params=params)
+                if isinstance(data, list):
+                    candidates.extend(x for x in data if isinstance(x, dict))
+            except Exception as exc:
+                log.debug("UEX terminal lookup failed for %s: %s", params, exc)
+
+        if not candidates:
+            return None
+
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for terminal in candidates:
+            names = [
+                terminal.get("name"),
+                terminal.get("fullname"),
+                terminal.get("displayname"),
+                terminal.get("nickname"),
+                terminal.get("code"),
+            ]
+            names = [str(x) for x in names if x]
+            if not names:
+                continue
+
+            score = max(fuzzy_score(location, name) for name in names)
+            ranked.append((score, terminal))
+
+        if not ranked:
+            return None
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_terminal = ranked[0]
+        log.info(
+            "Resolved terminal %r -> %r (id=%r, score=%s)",
+            location,
+            best_terminal.get("name") or best_terminal.get("displayname"),
+            best_terminal.get("id"),
+            best_score,
+        )
+        return best_terminal
+
+    async def get_terminal_distances(self, origin_terminal_id: int) -> dict[int, float]:
+        try:
+            data = await self._get(
+                "/terminals_distances",
+                params={"id_terminal_origin": origin_terminal_id},
+            )
+        except Exception as exc:
+            log.debug("UEX terminal distance lookup failed for %s: %s", origin_terminal_id, exc)
+            return {}
+
+        if not isinstance(data, list):
+            return {}
+
+        distance_map: dict[int, float] = {}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+
+            dest_id = row.get("id_terminal_destination") or row.get("id_terminal")
+            distance = row.get("distance")
+
+            try:
+                if dest_id is not None and distance is not None:
+                    distance_map[int(dest_id)] = float(distance)
+            except Exception:
+                continue
+
+        return distance_map
+
+    async def get_item_locations(self, name: str, location: str | None = None) -> list[dict[str, Any]]:
         item = await self.resolve_item(name)
         if not item:
             log.warning("No UEX item resolved for query %r", name)
@@ -180,9 +257,37 @@ class UEXClient:
             seen.add(key)
             deduped.append(row)
 
+        if not location:
+            deduped.sort(
+                key=lambda row: (
+                    row.get("price_buy") is None and row.get("price_sell") is None,
+                    row.get("terminal_name") or "",
+                )
+            )
+            return deduped
+
+        origin_terminal = await self.resolve_terminal(location)
+        if not origin_terminal:
+            log.warning("No UEX terminal resolved for location %r", location)
+            return deduped
+
+        origin_terminal_id = origin_terminal.get("id")
+        if origin_terminal_id is None:
+            return deduped
+
+        distance_map = await self.get_terminal_distances(int(origin_terminal_id))
+
+        for row in deduped:
+            terminal_id = row.get("id_terminal")
+            try:
+                row["_distance_gm"] = distance_map.get(int(terminal_id)) if terminal_id is not None else None
+            except Exception:
+                row["_distance_gm"] = None
+
         deduped.sort(
             key=lambda row: (
-                row.get("price_buy") is None and row.get("price_sell") is None,
+                row.get("_distance_gm") is None,
+                row.get("_distance_gm") if row.get("_distance_gm") is not None else 10**12,
                 row.get("terminal_name") or "",
             )
         )
