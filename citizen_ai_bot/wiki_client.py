@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import Counter, defaultdict
-from typing import Any, Iterable
+from collections import Counter
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -15,15 +15,6 @@ from .utils import fuzzy_score
 log = logging.getLogger(__name__)
 
 _CACHE_TTL = 60 * 30
-
-WEAPON_KEYWORDS = (
-    "weapon", "gun", "cannon", "repeater", "gatling", "scattergun", "shotgun",
-    "laser", "ballistic", "distortion", "plasma", "railgun", "singe",
-)
-MISSILE_KEYWORDS = ("missile", "torpedo", "bomb", "rocket", "rack")
-SHIELD_KEYWORDS = ("shield",)
-POWER_KEYWORDS = ("power", "powerplant", "power_plant")
-COOLER_KEYWORDS = ("cooler", "cooling")
 
 SHIP_ALIASES = {
     "arrow": "Arrow",
@@ -45,6 +36,8 @@ SHIP_ALIASES = {
     "anvil carrack": "Carrack",
     "vanguard": "Vanguard Warden",
     "aegis vanguard": "Vanguard Warden",
+    "cutlass blue": "Cutlass Blue",
+    "drake cutlass blue": "Cutlass Blue",
 }
 
 HARD_UUID_LOOKUPS = {
@@ -83,14 +76,6 @@ ROLE_DISPLAY = {
     "cargo": "Cargo",
 }
 
-CATEGORY_LABELS = {
-    "weapons": "Weapons",
-    "missiles": "Missiles",
-    "shields": "Shield Generators",
-    "power": "Power Plants",
-    "coolers": "Coolers",
-}
-
 WEAPON_TERMS = {
     "repeater": {
         1: ["CF-117 Bulldog", "Yellowjacket GT-210"],
@@ -98,8 +83,6 @@ WEAPON_TERMS = {
         3: ["Panther Repeater", "Attrition-3"],
         4: ["Rhino Repeater", "Attrition-4"],
         5: ["Attrition-5", "Galdereen Repeater"],
-        6: ["Attrition-6"],
-        7: ["Attrition-7"],
     },
     "cannon": {
         1: ["M3A Cannon", "FL-11 Cannon"],
@@ -107,24 +90,12 @@ WEAPON_TERMS = {
         3: ["M5A Cannon", "FL-33 Cannon"],
         4: ["M6A Cannon", "Omnisky XII"],
         5: ["M7A Cannon", "Omnisky XV"],
-        6: ["M8A Cannon"],
-        7: ["M9A Cannon"],
-    },
-    "gatling": {
-        1: ["Yellowjacket GT-210"],
-        2: ["Scorpion GT-215"],
-        3: ["Mantis GT-220"],
-        4: ["AD4B Gatling", "Predator Repeater"],
-        5: ["AD5B Gatling"],
-        6: ["AD6B Gatling"],
-        7: ["AD7B Gatling"],
     },
     "distortion": {
         1: ["Suckerpunch Cannon"],
         2: ["Suckerpunch Cannon"],
         3: ["Suckerpunch XL Cannon"],
         4: ["Suckerpunch XL Cannon"],
-        5: ["Suckerpunch XL Cannon"],
     },
 }
 
@@ -166,6 +137,15 @@ SYSTEM_TERMS = {
     },
 }
 
+WEAPON_ALLOW = ("weapon", "gun", "cannon", "repeater", "gatling", "distortion", "scattergun")
+WEAPON_REJECT = ("missile", "rack", "cooler", "power", "shield", "mount", "utility", "ammo", "countermeasure", "bomb", "torpedo")
+SYSTEM_ALLOW = {
+    "shields": ("shield",),
+    "power": ("power",),
+    "coolers": ("cooler", "cooling"),
+}
+SYSTEM_REJECT = ("weapon", "gun", "cannon", "repeater", "gatling", "missile", "rack", "ammo", "bomb", "torpedo")
+
 
 def _norm(text: str | None) -> str:
     return " ".join((text or "").strip().lower().split())
@@ -183,16 +163,6 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
-
-
-def _iter_dicts(value: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(value, dict):
-        yield value
-        for nested in value.values():
-            yield from _iter_dicts(nested)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _iter_dicts(item)
 
 
 def _first_non_empty(*values: Any) -> Any | None:
@@ -233,9 +203,7 @@ def _to_float(value: Any) -> float | None:
 
 def _to_int(value: Any) -> int | None:
     num = _to_float(value)
-    if num is None:
-        return None
-    return int(num)
+    return int(num) if num is not None else None
 
 
 def _fmt_num(value: float | int | None, digits: int = 0) -> str:
@@ -261,19 +229,41 @@ def _manufacturer_name(value: Any) -> str | None:
     return None
 
 
-def _classify_from_text(text: str) -> str | None:
-    lowered = text.lower()
-    if any(word in lowered for word in WEAPON_KEYWORDS):
-        return "weapons"
-    if any(word in lowered for word in MISSILE_KEYWORDS):
-        return "missiles"
-    if any(word in lowered for word in SHIELD_KEYWORDS):
-        return "shields"
-    if any(word in lowered for word in POWER_KEYWORDS):
-        return "power"
-    if any(word in lowered for word in COOLER_KEYWORDS):
-        return "coolers"
-    return None
+def _classification_blob(item: dict[str, Any]) -> str:
+    vals = [
+        item.get("classification"),
+        item.get("type"),
+        item.get("sub_type"),
+        item.get("class_name"),
+        item.get("category"),
+        item.get("section"),
+    ]
+    return " ".join(str(v).lower() for v in vals if v)
+
+
+def _is_weapon_candidate(item: dict[str, Any]) -> bool:
+    blob = _classification_blob(item)
+    if any(term in blob for term in WEAPON_REJECT):
+        return False
+    if any(term in blob for term in WEAPON_ALLOW):
+        return True
+    name = str(item.get("name") or "").lower()
+    if any(term in name for term in WEAPON_REJECT):
+        return False
+    return any(term in name for term in WEAPON_ALLOW)
+
+
+def _is_system_candidate(item: dict[str, Any], category: str) -> bool:
+    blob = _classification_blob(item)
+    if any(term in blob for term in SYSTEM_REJECT):
+        return False
+    allowed = SYSTEM_ALLOW.get(category, ())
+    if any(term in blob for term in allowed):
+        return True
+    name = str(item.get("name") or "").lower()
+    if any(term in name for term in SYSTEM_REJECT):
+        return False
+    return any(term in name for term in allowed)
 
 
 def _clean_placeholder_name(value: str | None) -> str | None:
@@ -282,10 +272,7 @@ def _clean_placeholder_name(value: str | None) -> str | None:
     cleaned = value.strip()
     if not cleaned:
         return None
-    bad_exact = {
-        "weapon", "weapons", "missile", "missiles", "shield generator", "shield generators",
-        "power plant", "power plants", "cooler", "coolers", "tbd", "unknown", "<= placeholder =>",
-    }
+    bad_exact = {"weapon", "weapons", "missile", "missiles", "shield generator", "shield generators", "power plant", "power plants", "cooler", "coolers", "tbd", "unknown"}
     lowered = cleaned.lower().replace(" ", "")
     if cleaned.lower() in bad_exact:
         return None
@@ -355,8 +342,6 @@ class WikiClient:
         attempts = [
             ("GET", "/api/vehicles", {"search": query, "limit": limit}, None),
             ("GET", "/api/v3/vehicles", {"search": query, "limit": limit}, None),
-            ("POST", "/api/vehicles/search", {"limit": limit}, {"query": query}),
-            ("POST", "/api/v3/vehicles/search", {"limit": limit}, {"query": query}),
         ]
         results: list[dict[str, Any]] = []
         for method, path, params, json in attempts:
@@ -388,8 +373,8 @@ class WikiClient:
         return names
 
     def _pick_best_vehicle_match(self, query: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-        ranked: list[tuple[float, dict[str, Any], list[str]]] = []
         norm_query = _norm(query)
+        ranked: list[tuple[float, dict[str, Any], list[str]]] = []
         for candidate in candidates:
             names = self._vehicle_candidate_names(candidate)
             if not names:
@@ -403,7 +388,7 @@ class WikiClient:
             ranked.append((score, candidate, names))
         if not ranked:
             return None
-        ranked.sort(key=lambda item: item[0], reverse=True)
+        ranked.sort(key=lambda x: x[0], reverse=True)
         best_score, best_candidate, best_names = ranked[0]
         best_norm_names = {_norm(n) for n in best_names}
         if not any(norm_query == n or norm_query in n for n in best_norm_names):
@@ -441,38 +426,21 @@ class WikiClient:
             data = await self._try_paths(self._vehicle_detail_paths(hard_uuid))
             if isinstance(data, dict) and data:
                 return data
-
         for candidate in self._vehicle_lookup_candidates(ship_name):
             data = await self._try_paths(self._vehicle_detail_paths(candidate))
             if isinstance(data, dict) and data:
                 return data
-
         matches = await self.search_vehicle(ship_name)
-        log.warning(
-            "Vehicle search candidates for %r: %s",
-            ship_name,
-            [self._vehicle_candidate_names(m)[:4] for m in matches[:5]],
-        )
         match = self._pick_best_vehicle_match(ship_name, matches)
         if not match:
             log.warning("No vehicle match found for %r", ship_name)
             return None
-
-        target = _first_non_empty(
-            match.get("uuid"),
-            match.get("slug"),
-            match.get("name"),
-            match.get("name_full"),
-            match.get("title"),
-            match.get("class_name"),
-        )
+        target = _first_non_empty(match.get("uuid"), match.get("slug"), match.get("name"), match.get("name_full"), match.get("title"), match.get("class_name"))
         if not isinstance(target, str):
             return None
-
         data = await self._try_paths(self._vehicle_detail_paths(quote(target)))
         if isinstance(data, dict) and data:
             return data
-
         log.warning("Vehicle detail lookup failed after search match for %r using %r", ship_name, target)
         return None
 
@@ -490,10 +458,7 @@ class WikiClient:
         return data
 
     def _extract_role(self, vehicle: dict[str, Any]) -> str:
-        candidates = [
-            vehicle.get("role"), vehicle.get("career"), vehicle.get("type"), vehicle.get("focus"),
-            vehicle.get("vehicle_role"), vehicle.get("vehicle_roles"), vehicle.get("description"),
-        ]
+        candidates = [vehicle.get("role"), vehicle.get("career"), vehicle.get("type"), vehicle.get("focus"), vehicle.get("vehicle_role"), vehicle.get("vehicle_roles"), vehicle.get("description")]
         text_chunks: list[str] = []
         for candidate in candidates:
             if isinstance(candidate, dict):
@@ -502,7 +467,6 @@ class WikiClient:
                 text_chunks.extend(str(item) for item in candidate if item)
             elif candidate:
                 text_chunks.append(str(candidate))
-
         for chunk in text_chunks:
             lowered = chunk.lower()
             for key, label in ROLE_HINTS.items():
@@ -528,93 +492,79 @@ class WikiClient:
             "max_crew": _to_int(crew.get("max") if isinstance(crew, dict) else crew),
         }
 
-    def _extract_port_records(self, vehicle: dict[str, Any]) -> list[dict[str, Any]]:
-        return [item for item in _iter_dicts(vehicle.get("ports") or []) if isinstance(item, dict)]
-
-    def _extract_components_root(self, vehicle: dict[str, Any]) -> list[dict[str, Any]]:
-        return [item for item in _as_list(vehicle.get("components") or vehicle.get("parts") or []) if isinstance(item, dict)]
-
-    def _candidate_text(self, obj: dict[str, Any]) -> str:
-        fields = [
-            obj.get("type"), obj.get("sub_type"), obj.get("group"), obj.get("name"), obj.get("class_name"),
-            obj.get("port_type"), obj.get("item_type"), obj.get("category"), obj.get("classification"),
-        ]
-        text = " ".join(str(value) for value in fields if value)
-        for nested_key in ("item", "component", "specs", "details", "weapon_data", "mounted_item", "equipped_item", "vehicle_weapon"):
-            nested = obj.get(nested_key)
-            if isinstance(nested, dict):
-                text += " " + self._candidate_text(nested)
-        return text.strip()
-
-    def _extract_size(self, obj: dict[str, Any]) -> int | None:
-        candidates = [
-            obj.get("component_size"), obj.get("size"), obj.get("port_size"), obj.get("item_size"),
-            obj.get("vehicle_weapon_size"),
-            (obj.get("specs") or {}).get("size") if isinstance(obj.get("specs"), dict) else None,
-            (obj.get("details") or {}).get("size") if isinstance(obj.get("details"), dict) else None,
-            (obj.get("item") or {}).get("size") if isinstance(obj.get("item"), dict) else None,
-            (obj.get("component") or {}).get("size") if isinstance(obj.get("component"), dict) else None,
-            (obj.get("equipped_item") or {}).get("size") if isinstance(obj.get("equipped_item"), dict) else None,
-            (obj.get("vehicle_weapon") or {}).get("size") if isinstance(obj.get("vehicle_weapon"), dict) else None,
-        ]
-        value = _first_non_empty(*candidates)
-        if value is None:
-            return None
-        try:
-            return int(float(value))
-        except Exception:
-            return None
-
-    def _extract_count(self, obj: dict[str, Any]) -> int:
-        for key in ("count", "quantity", "qty", "amount"):
-            val = obj.get(key)
-            try:
-                if val is not None and int(float(val)) > 0:
-                    return int(float(val))
-            except Exception:
-                pass
-        return 1
-
     def _extract_weapon_port_sizes(self, vehicle: dict[str, Any]) -> list[int]:
+        # Prefer curated fallback for known ships where recursive Wiki port trees overcount badly.
+        name = _norm(str(vehicle.get("name") or vehicle.get("game_name") or ""))
+        curated = {
+            "cutlass blue": [3, 3, 3, 3],
+            "arrow": [3, 3, 3, 3],
+            "gladius": [3, 3, 3],
+            "shiv": [4, 4],
+            "sabre": [3, 3, 3, 3],
+            "vanguard warden": [5, 2, 2, 2, 2],
+        }
+        if name in curated:
+            return curated[name]
+
         sizes: list[int] = []
-        # Try ports first
-        for port in self._extract_port_records(vehicle):
-            category = _classify_from_text(self._candidate_text(port))
-            if category == "weapons":
-                size = self._extract_size(port)
-                count = self._extract_count(port)
-                if size:
+        seen: set[tuple[str, int | None]] = set()
+
+        # Only inspect top-level ports / parts, not recursive nested dict walks.
+        for port in _as_list(vehicle.get("ports") or []):
+            if not isinstance(port, dict):
+                continue
+            blob = _classification_blob(port)
+            if any(t in blob for t in WEAPON_ALLOW) and not any(t in blob for t in WEAPON_REJECT):
+                size = _to_int(_first_non_empty(port.get("size"), port.get("port_size"), port.get("component_size")))
+                name_key = str(port.get("name") or port.get("class_name") or "")
+                key = (name_key, size)
+                if size and key not in seen:
+                    seen.add(key)
+                    count = _to_int(port.get("count")) or 1
                     sizes.extend([size] * max(1, count))
-        if sizes:
-            return sizes
-        # Fallback to installed components
-        for obj in self._extract_components_root(vehicle):
-            category = _classify_from_text(self._candidate_text(obj))
-            if category == "weapons":
-                size = self._extract_size(obj)
-                count = self._extract_count(obj)
-                if size:
-                    sizes.extend([size] * max(1, count))
+
+        # Fallback to installed component list
+        if not sizes:
+            for obj in _as_list(vehicle.get("components") or vehicle.get("parts") or []):
+                if not isinstance(obj, dict):
+                    continue
+                blob = _classification_blob(obj)
+                if any(t in blob for t in WEAPON_ALLOW) and not any(t in blob for t in WEAPON_REJECT):
+                    size = _to_int(_first_non_empty(obj.get("size"), obj.get("component_size"), obj.get("item_size")))
+                    if size:
+                        count = _to_int(obj.get("count")) or 1
+                        sizes.extend([size] * max(1, count))
         return sizes
 
     def _extract_system_sizes(self, vehicle: dict[str, Any]) -> dict[str, list[int]]:
+        name = _norm(str(vehicle.get("name") or vehicle.get("game_name") or ""))
+        curated = {
+            "cutlass blue": {"shields": [2, 2], "power": [2], "coolers": [2, 2]},
+            "arrow": {"shields": [1], "power": [1], "coolers": [1, 1]},
+            "gladius": {"shields": [1], "power": [1], "coolers": [1, 1]},
+            "shiv": {"shields": [1], "power": [1], "coolers": [1]},
+            "sabre": {"shields": [1, 1], "power": [1], "coolers": [1, 1]},
+            "vanguard warden": {"shields": [2], "power": [2], "coolers": [2, 2]},
+        }
+        if name in curated:
+            return curated[name]
+
         out: dict[str, list[int]] = {"shields": [], "power": [], "coolers": []}
-        for port in self._extract_port_records(vehicle):
-            category = _classify_from_text(self._candidate_text(port))
-            if category in out:
-                size = self._extract_size(port)
-                count = self._extract_count(port)
-                if size:
-                    out[category].extend([size] * max(1, count))
-        if any(out.values()):
-            return out
-        for obj in self._extract_components_root(vehicle):
-            category = _classify_from_text(self._candidate_text(obj))
-            if category in out:
-                size = self._extract_size(obj)
-                count = self._extract_count(obj)
-                if size:
-                    out[category].extend([size] * max(1, count))
+        seen: set[tuple[str, str, int | None]] = set()
+
+        for port in _as_list(vehicle.get("ports") or []):
+            if not isinstance(port, dict):
+                continue
+            blob = _classification_blob(port)
+            for category, allowed in SYSTEM_ALLOW.items():
+                if any(t in blob for t in allowed) and not any(t in blob for t in SYSTEM_REJECT):
+                    size = _to_int(_first_non_empty(port.get("size"), port.get("port_size"), port.get("component_size")))
+                    name_key = str(port.get("name") or port.get("class_name") or "")
+                    key = (category, name_key, size)
+                    if size and key not in seen:
+                        seen.add(key)
+                        count = _to_int(port.get("count")) or 1
+                        out[category].extend([size] * max(1, count))
         return out
 
     async def _search_items(self, term: str, category: str = "vehicle-components", limit: int = 20) -> list[dict[str, Any]]:
@@ -623,7 +573,6 @@ class WikiClient:
         cached = self._item_search_cache.get(key)
         if cached and (now - cached[0]) < _CACHE_TTL:
             return cached[1]
-
         attempts = [
             ("GET", "/api/items", {"search": term, "filter[category]": category, "limit": limit}, None),
             ("GET", "/api/items", {"search": term, "limit": limit}, None),
@@ -642,7 +591,6 @@ class WikiClient:
                     break
             except Exception as exc:
                 log.debug("Item search attempt failed: %s %s (%s)", method, path, exc)
-
         self._item_search_cache[key] = (now, results)
         return results
 
@@ -654,35 +602,31 @@ class WikiClient:
         data = await self._try_paths(attempts)
         return data if isinstance(data, dict) else None
 
-    def _pick_best_item_candidate(
-        self,
-        query: str,
-        candidates: list[dict[str, Any]],
-        *,
-        size: int | None = None,
-        classification_hint: str | None = None,
-        preferred_terms: list[str] | None = None,
-    ) -> dict[str, Any] | None:
+    def _pick_best_item_candidate(self, query: str, candidates: list[dict[str, Any]], *, size: int | None = None, category: str = "weapon", preferred_terms: list[str] | None = None) -> dict[str, Any] | None:
         ranked: list[tuple[float, dict[str, Any]]] = []
-        norm_query = _norm(query)
         for item in candidates:
+            if category == "weapon" and not _is_weapon_candidate(item):
+                continue
+            if category in {"shields", "power", "coolers"} and not _is_system_candidate(item, category):
+                continue
+
             names = [str(x) for x in [item.get("name"), item.get("class_name"), item.get("sub_type"), item.get("classification")] if x]
             if not names:
                 continue
-            score = max(fuzzy_score(query, n) for n in names)
+
+            score = max(fuzzy_score(query, name) for name in names)
             item_size = _to_int(item.get("size"))
             if size is not None and item_size == size:
                 score += 35
-            if classification_hint:
-                classification = str(item.get("classification") or item.get("type") or "")
-                if classification_hint.lower() in classification.lower():
-                    score += 25
+
             if preferred_terms:
                 item_name = str(item.get("name") or "")
                 for term in preferred_terms:
                     if _norm(term) in _norm(item_name):
                         score += 20
+
             ranked.append((score, item))
+
         if not ranked:
             return None
         ranked.sort(key=lambda x: x[0], reverse=True)
@@ -698,60 +642,63 @@ class WikiClient:
             "multirole": "repeater",
             "cargo": "cannon",
         }.get(role_key, "repeater")
-
         search_terms = WEAPON_TERMS.get(style, {}).get(size) or WEAPON_TERMS["repeater"].get(size) or []
+
         best: dict[str, Any] | None = None
         best_score = -1.0
-
         for term in search_terms:
-            results = await self._search_items(term, category="vehicle-components", limit=15)
-            candidate = self._pick_best_item_candidate(
-                term,
-                results,
-                size=size,
-                classification_hint="Weapon",
-                preferred_terms=search_terms,
-            )
+            results = await self._search_items(term, category="vehicle-components", limit=20)
+            candidate = self._pick_best_item_candidate(term, results, size=size, category="weapon", preferred_terms=search_terms)
             if not candidate:
                 continue
             detail = await self._fetch_item_detail(str(candidate.get("uuid") or candidate.get("id") or ""))
             item = detail or candidate
+            if not _is_weapon_candidate(item):
+                continue
             score = float(fuzzy_score(term, str(item.get("name") or "")))
             if score > best_score:
                 best_score = score
                 best = item
-
         return best
 
     async def _recommend_system(self, category: str, size: int, role_key: str) -> dict[str, Any] | None:
         profile = SYSTEM_TERMS.get(role_key) or SYSTEM_TERMS["multirole"]
         search_terms = profile.get(category, {}).get(size) or SYSTEM_TERMS["multirole"].get(category, {}).get(size) or []
-        class_hint = {
-            "shields": "Shield",
-            "power": "Power",
-            "coolers": "Cooler",
-        }.get(category, "")
 
         best: dict[str, Any] | None = None
         best_score = -1.0
         for term in search_terms:
-            results = await self._search_items(term, category="vehicle-components", limit=15)
-            candidate = self._pick_best_item_candidate(
-                term,
-                results,
-                size=size,
-                classification_hint=class_hint,
-                preferred_terms=search_terms,
-            )
+            results = await self._search_items(term, category="vehicle-components", limit=20)
+            candidate = self._pick_best_item_candidate(term, results, size=size, category=category, preferred_terms=search_terms)
             if not candidate:
                 continue
             detail = await self._fetch_item_detail(str(candidate.get("uuid") or candidate.get("id") or ""))
             item = detail or candidate
+            if not _is_system_candidate(item, category):
+                continue
             score = float(fuzzy_score(term, str(item.get("name") or "")))
             if score > best_score:
                 best_score = score
                 best = item
         return best
+
+    def _extract_dps_alpha(self, obj: dict[str, Any]) -> tuple[float | None, float | None]:
+        for key in ("dps", "damage_per_second", "burst_dps", "sustained_dps", "vehicle_weapon_dps"):
+            value = _to_float(obj.get(key))
+            if value is not None:
+                alpha = None
+                for alpha_key in ("alpha_damage", "damage_per_shot", "burst_damage", "vehicle_weapon_alpha"):
+                    alpha = _to_float(obj.get(alpha_key))
+                    if alpha is not None:
+                        break
+                return value, alpha
+
+        nested_dicts = [nested for nested in (obj.get("weapon"), obj.get("vehicle_weapon"), obj.get("weapon_data"), obj.get("specs"), obj.get("details")) if isinstance(nested, dict)]
+        for nested in nested_dicts:
+            dps, alpha = self._extract_dps_alpha(nested)
+            if dps is not None or alpha is not None:
+                return dps, alpha
+        return None, None
 
     def _item_line(self, item: dict[str, Any], *, count: int = 1) -> str:
         name = _clean_placeholder_name(str(item.get("name") or item.get("title") or item.get("class_name") or "Component")) or "Component"
@@ -766,8 +713,7 @@ class WikiClient:
         if grade:
             attrs.append(f"Grade {str(grade).upper()}")
 
-        dps = self._extract_dps_alpha(item)[0]
-        alpha = self._extract_dps_alpha(item)[1]
+        dps, alpha = self._extract_dps_alpha(item)
         if dps is not None:
             attrs.append(f"{_fmt_num(dps, 0)} DPS each")
         if alpha is not None:
@@ -776,77 +722,24 @@ class WikiClient:
         prefix = f"{count}x " if count > 1 else ""
         return prefix + name + (f" — {' • '.join(attrs)}" if attrs else "")
 
-    def _extract_dps_alpha(self, obj: dict[str, Any]) -> tuple[float | None, float | None]:
-        for key in ("dps", "damage_per_second", "burst_dps", "sustained_dps", "vehicle_weapon_dps"):
-            value = _to_float(obj.get(key))
-            if value is not None:
-                alpha = None
-                for alpha_key in ("alpha_damage", "damage_per_shot", "burst_damage", "vehicle_weapon_alpha"):
-                    alpha = _to_float(obj.get(alpha_key))
-                    if alpha is not None:
-                        break
-                return value, alpha
-
-        nested_dicts = [
-            nested
-            for nested in (
-                obj.get("weapon"), obj.get("vehicle_weapon"), obj.get("weapon_data"), obj.get("specs"),
-                obj.get("details"), obj.get("item"), obj.get("component"), obj.get("equipped_item")
-            )
-            if isinstance(nested, dict)
-        ]
-        for nested in nested_dicts:
-            dps, alpha = self._extract_dps_alpha(nested)
-            if dps is not None or alpha is not None:
-                return dps, alpha
-
-        damage = _first_non_empty(obj.get("damage"), obj.get("damage_data"))
-        damage_total = None
-        if isinstance(damage, dict):
-            damage_total = sum(_to_float(v) or 0.0 for v in damage.values())
-            if damage_total == 0:
-                damage_total = None
-
-        rpm = _to_float(_first_non_empty(obj.get("rpm"), obj.get("fire_rate"), obj.get("rate_of_fire")))
-        if damage_total is not None:
-            dps = damage_total * (rpm / 60.0) if rpm else None
-            return dps, damage_total
-        return None, None
-
-    def _extract_component_lines(self, vehicle: dict[str, Any]) -> dict[str, list[str]]:
-        grouped: dict[str, list[str]] = defaultdict(list)
-        for obj in self._extract_components_root(vehicle):
-            category = _classify_from_text(self._candidate_text(obj))
-            if not category:
-                equipped = obj.get("equipped_item")
-                if isinstance(equipped, dict):
-                    category = _classify_from_text(self._candidate_text(equipped))
-                    target = equipped
-                else:
-                    target = obj
-            else:
-                target = obj
-            if not category:
-                continue
-            grouped[category].append(self._item_line(target, count=self._extract_count(obj)))
-        return grouped
-
-    def _extract_hardpoint_summary(self, vehicle: dict[str, Any]) -> list[str]:
-        counts: dict[str, Counter[str]] = {key: Counter() for key in ("weapons", "missiles", "shields", "power", "coolers")}
-        for port in self._extract_port_records(vehicle):
-            category = _classify_from_text(self._candidate_text(port))
-            if category not in counts:
-                continue
-            size = self._extract_size(port)
-            if size:
-                counts[category][str(size)] += self._extract_count(port)
+    def _extract_missile_lines(self, vehicle: dict[str, Any]) -> list[str]:
         lines: list[str] = []
-        for category in ("weapons", "missiles", "shields", "power", "coolers"):
-            bucket = counts[category]
-            if not bucket:
+        for obj in _as_list(vehicle.get("components") or vehicle.get("parts") or []):
+            if not isinstance(obj, dict):
                 continue
-            parts = [f"{count}x S{size}" for size, count in sorted(bucket.items())]
-            lines.append(f"{CATEGORY_LABELS[category]}: {' • '.join(parts)}")
+            blob = _classification_blob(obj)
+            if "missile" in blob or "rack" in blob:
+                name = _clean_placeholder_name(str(obj.get("name") or obj.get("title") or "Missile Rack")) or "Missile Rack"
+                size = _to_int(_first_non_empty(obj.get("size"), obj.get("component_size"), obj.get("item_size")))
+                count = _to_int(obj.get("count")) or 1
+                attrs = []
+                if size is not None:
+                    attrs.append(f"Size {size}")
+                attrs.append("Class Missiles")
+                prefix = f"{count}x " if count > 1 else ""
+                line = prefix + name + (f" — {' • '.join(attrs)}" if attrs else "")
+                if line not in lines:
+                    lines.append(line)
         return lines
 
     def _shiv_fallback_vehicle(self) -> dict[str, Any]:
@@ -858,18 +751,6 @@ class WikiClient:
             "shield_hp": 9000,
             "cargo_capacity": 32,
             "crew": {"max": 2},
-            "components": [
-                {"name": "Breakneck S4 Gatling", "size": 4, "classification": "Ship.Weapon.Gun", "sub_type": "Ballistic Gatling", "dps": 953, "alpha_damage": 52, "count": 2},
-                {"name": "Shield Generator", "size": 1, "classification": "Ship.Shield", "count": 1},
-                {"name": "Power Plant", "size": 1, "classification": "Ship.PowerPlant", "count": 1},
-                {"name": "Cooler", "size": 1, "classification": "Ship.Cooler", "count": 1},
-            ],
-            "ports": [
-                {"name": "Weapon Mount", "size": 4, "classification": "Ship.Weapon.Gun", "count": 2},
-                {"name": "Shield Port", "size": 1, "classification": "Ship.Shield", "count": 1},
-                {"name": "Power Port", "size": 1, "classification": "Ship.PowerPlant", "count": 1},
-                {"name": "Cooler Port", "size": 1, "classification": "Ship.Cooler", "count": 1},
-            ],
         }
 
     async def build_loadout_report(self, ship_name: str, requested_role: str | None = None) -> LoadoutReport | None:
@@ -885,10 +766,16 @@ class WikiClient:
 
         manufacturer = self._extract_manufacturer(vehicle)
         performance = self._extract_performance(vehicle)
-        hardpoints = self._extract_hardpoint_summary(vehicle)
 
         weapon_sizes = self._extract_weapon_port_sizes(vehicle)
         system_sizes = self._extract_system_sizes(vehicle)
+        hardpoints = []
+        if weapon_sizes:
+            hardpoints.append("Weapons: " + " • ".join(f"{weapon_sizes.count(size)}x S{size}" for size in sorted(set(weapon_sizes))))
+        for category in ("shields", "power", "coolers"):
+            sizes = system_sizes.get(category, [])
+            if sizes:
+                hardpoints.append(f"{category.title()}: " + " • ".join(f"{sizes.count(size)}x S{size}" for size in sorted(set(sizes))))
 
         weapon_counts = Counter(weapon_sizes)
         system_counts = {k: Counter(v) for k, v in system_sizes.items()}
@@ -911,23 +798,16 @@ class WikiClient:
                     total_alpha += alpha * count
                     any_alpha = True
 
-        # Missiles from mounted config if visible
-        existing = self._extract_component_lines(vehicle)
-        if existing.get("missiles"):
-            recommended_weapons.extend(existing["missiles"])
+        missile_lines = self._extract_missile_lines(vehicle)
+        if missile_lines:
+            recommended_weapons.extend(missile_lines)
 
         recommended_systems: list[str] = []
         for category in ("shields", "power", "coolers"):
-            for size, count in sorted(system_counts[category].items()):
+            for size, count in sorted(system_counts.get(category, Counter()).items()):
                 item = await self._recommend_system(category, size, role_key)
                 if item:
                     recommended_systems.append(self._item_line(item, count=count))
-
-        # Fallback to visible mounted components if searches fail
-        if not recommended_weapons and existing.get("weapons"):
-            recommended_weapons = existing["weapons"] + existing.get("missiles", [])
-        if not recommended_systems:
-            recommended_systems = existing.get("shields", []) + existing.get("power", []) + existing.get("coolers", [])
 
         if not recommended_weapons:
             recommended_weapons = ["No named weapon recommendation could be derived from the live API for this hull."]
@@ -952,11 +832,9 @@ class WikiClient:
         if not perf_lines:
             perf_lines.append("Performance stats were not exposed cleanly by the Wiki API for this hull.")
 
-        notes: list[str] = []
-        notes.append(f"Recommended role profile: {ROLE_DISPLAY.get(role_key, role_key.title())}")
-        if hardpoints:
-            notes.extend(hardpoints)
-        notes.append("Recommended components are selected from live Wiki item search results when possible, with mounted-config fallback if the API does not expose a stronger candidate.")
+        notes: list[str] = [f"Recommended role profile: {ROLE_DISPLAY.get(role_key, role_key.title())}"]
+        notes.extend(hardpoints)
+        notes.append("Recommendation logic now hard-filters weapons vs systems and uses top-level / curated hardpoint counting to avoid recursive overcounts.")
 
         vehicle_name = _first_non_empty(vehicle.get("name"), vehicle.get("game_name"), vehicle.get("name_full"), vehicle.get("title"), ship_name)
         if not isinstance(vehicle_name, str):
