@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -66,10 +68,18 @@ class StarCitizenCog(commands.Cog):
         )
         await interaction.followup.send(embed=simple_embed("Advice", text))
 
-    @app_commands.command(name="loadout", description="Ship loadout recommendation and mounted component report.")
-    async def loadout(self, interaction: discord.Interaction, ship_name: str) -> None:
+    @app_commands.command(
+        name="loadout",
+        description="Recommend a role-based ship build with named weapons, modules, and stats.",
+    )
+    async def loadout(
+        self,
+        interaction: discord.Interaction,
+        ship_name: str,
+        role: Literal["combat", "interceptor", "heavy_fighter", "stealth", "exploration", "multirole", "cargo"] | None = None,
+    ) -> None:
         await interaction.response.defer()
-        report = await self.service.suggest_loadout(ship_name)
+        report = await self.service.suggest_loadout(ship_name, role=role)
         await interaction.followup.send(embed=loadout_embed(report, ship_name))
 
     @app_commands.command(name="mining", description="Mining suggestion.")
