@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from .uex_client import UEXClient
 from .wiki_client import WikiClient
@@ -45,7 +44,7 @@ class StarCitizenService:
             "overall": uex_ok or wiki_ok,
         }
 
-    async def get_item_locations(self, name: str, location: str | None = None) -> list[dict[str, Any]]:
+    async def get_item_locations(self, name: str, location: str | None = None) -> list[dict]:
         return await self.client.get_item_locations(name, location=location)
 
     async def suggest_trade_route(self, commodity: str) -> str:
