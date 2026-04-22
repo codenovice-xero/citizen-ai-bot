@@ -184,17 +184,26 @@ class UEXClient:
         search_term = terminal_aliases.get(query, location)
         candidates: list[dict[str, Any]] = []
 
-        for params in (
-            {"name": search_term},
-            {"fullname": search_term},
-            {"displayname": search_term},
-        ):
-            try:
-                data = await self._get("/terminals", params=params)
-                if isinstance(data, list):
-                    candidates.extend(x for x in data if isinstance(x, dict))
-            except Exception as exc:
-                log.debug("UEX terminal lookup failed for %s: %s", params, exc)
+        # broad terminal pull and local ranking works better than exact server-side matching
+        try:
+            data = await self._get("/terminals")
+            if isinstance(data, list):
+                candidates.extend(x for x in data if isinstance(x, dict))
+        except Exception as exc:
+            log.debug("UEX full terminal lookup failed: %s", exc)
+
+        if not candidates:
+            for params in (
+                {"name": search_term},
+                {"fullname": search_term},
+                {"displayname": search_term},
+            ):
+                try:
+                    data = await self._get("/terminals", params=params)
+                    if isinstance(data, list):
+                        candidates.extend(x for x in data if isinstance(x, dict))
+                except Exception as exc:
+                    log.debug("UEX terminal lookup failed for %s: %s", params, exc)
 
         if not candidates:
             return None
@@ -212,6 +221,8 @@ class UEXClient:
                 terminal.get("code"),
                 terminal.get("city_name"),
                 terminal.get("planet_name"),
+                terminal.get("moon_name"),
+                terminal.get("orbit_name"),
             ]
             names = [str(x) for x in names if x]
             if not names:
@@ -249,33 +260,49 @@ class UEXClient:
         return best_terminal
 
     async def get_terminal_distances(self, origin_terminal_id: int) -> dict[int, float]:
-        try:
-            data = await self._get(
-                "/terminals_distances",
-                params={"id_terminal_origin": origin_terminal_id},
-            )
-        except Exception as exc:
-            log.debug("UEX terminal distance lookup failed for %s: %s", origin_terminal_id, exc)
-            return {}
-
-        if not isinstance(data, list):
-            return {}
-
         distance_map: dict[int, float] = {}
-        for row in data:
-            if not isinstance(row, dict):
-                continue
 
-            dest_id = row.get("id_terminal_destination") or row.get("id_terminal")
-            distance = row.get("distance")
+        # Try multiple plausible parameter names / endpoint shapes.
+        attempts = [
+            {"id_terminal_origin": origin_terminal_id},
+            {"id_terminal": origin_terminal_id},
+            {"id_terminal_from": origin_terminal_id},
+        ]
 
+        for params in attempts:
             try:
-                if dest_id is not None and distance is not None:
-                    distance_map[int(dest_id)] = float(distance)
-            except Exception:
+                data = await self._get("/terminals_distances", params=params)
+            except Exception as exc:
+                log.debug("UEX terminal distance lookup failed for %s: %s", params, exc)
                 continue
 
-        return distance_map
+            if not isinstance(data, list):
+                continue
+
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+
+                dest_id = (
+                    row.get("id_terminal_destination")
+                    or row.get("id_terminal_to")
+                    or row.get("id_terminal")
+                    or row.get("terminal_id")
+                )
+                distance = row.get("distance") or row.get("distance_gm") or row.get("dist")
+
+                try:
+                    if dest_id is not None and distance is not None:
+                        distance_map[int(dest_id)] = float(distance)
+                except Exception:
+                    continue
+
+            if distance_map:
+                log.info("Resolved %s terminal distances from %s", len(distance_map), origin_terminal_id)
+                return distance_map
+
+        log.warning("No terminal distance map returned for origin terminal %s", origin_terminal_id)
+        return {}
 
     async def get_item_locations(self, name: str, location: str | None = None) -> list[dict[str, Any]]:
         item = await self.resolve_item(name)
@@ -366,6 +393,20 @@ class UEXClient:
                 row.get("terminal_name") or "",
             )
         )
+
+        # helpful debug sample
+        if deduped:
+            preview = [
+                (
+                    row.get("terminal_name"),
+                    row.get("_distance_gm"),
+                    row.get("price_buy"),
+                    row.get("price_sell"),
+                )
+                for row in deduped[:5]
+            ]
+            log.info("Nearest item results preview for %r from %r: %s", name, location, preview)
+
         return deduped
 
     async def price_snapshot(self, commodity: str) -> list[dict[str, Any]]:
