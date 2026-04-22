@@ -1,86 +1,133 @@
 from __future__ import annotations
+
 import discord
+
+from .models import LoadoutReport
 
 FOOTER = "Citizen AI • Star Citizen Utility Bot"
 
 
-def simple_embed(title: str, description: str):
-    e = discord.Embed(title=title, description=description)
-    e.set_footer(text=FOOTER)
-    return e
+def _truncate_lines(lines: list[str], max_len: int = 1000) -> str:
+    if not lines:
+        return "No data."
+    out: list[str] = []
+    total = 0
+    for line in lines:
+        entry = f"• {line}"
+        if total + len(entry) + 1 > max_len:
+            break
+        out.append(entry)
+        total += len(entry) + 1
+    return "\n".join(out) if out else "No data."
 
 
-def status_embed(status: dict):
-    ok = status.get("overall", False)
+def simple_embed(title: str, description: str) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description)
+    embed.set_footer(text=FOOTER)
+    return embed
 
-    e = discord.Embed(
-        title="🟢 Citizen AI Status" if ok else "🟡 Citizen AI Status",
-        description="All systems operational." if ok else "One or more providers unreachable."
+
+def status_embed(status: dict[str, bool]) -> discord.Embed:
+    overall_ok = status.get("overall", False)
+    embed = discord.Embed(
+        title="🟢 Citizen AI Status" if overall_ok else "🟡 Citizen AI Status",
+        description=(
+            "All connected services answered cleanly."
+            if overall_ok
+            else "The bot is online, but one or more data providers did not answer cleanly."
+        ),
     )
+    embed.add_field(name="Bot", value="Online", inline=True)
+    embed.add_field(
+        name="UEX",
+        value="Reachable" if status.get("uex_api") else "Unreachable",
+        inline=True,
+    )
+    embed.add_field(
+        name="Wiki",
+        value="Reachable" if status.get("wiki_api") else "Unreachable",
+        inline=True,
+    )
+    embed.set_footer(text=FOOTER)
+    return embed
 
-    e.add_field(name="Bot", value="Online", inline=True)
-    e.add_field(name="UEX", value="Reachable" if status.get("uex_api") else "Unreachable", inline=True)
-    e.add_field(name="Wiki", value="Reachable" if status.get("wiki_api") else "Unreachable", inline=True)
 
-    e.set_footer(text=FOOTER)
-    return e
+def item_embed(item_name: str, rows: list[dict], location: str | None = None) -> discord.Embed:
+    title = f"📦 {item_name}"
+    if location:
+        title += f" • from {location}"
 
-
-def item_embed(item_name: str, rows: list):
-    e = discord.Embed(title=f"📦 {item_name}")
+    embed = discord.Embed(title=title)
 
     if not rows:
-        e.description = "No item data was returned for that query."
-        e.set_footer(text=FOOTER)
-        return e
+        embed.description = "No item data was returned for that query."
+        embed.set_footer(text=FOOTER)
+        return embed
 
-    lines = []
+    lines: list[str] = []
+    for row in rows[:20]:
+        terminal = (
+            row.get("terminal_name")
+            or row.get("terminal")
+            or row.get("name_terminal")
+            or "Unknown terminal"
+        )
 
-    for row in rows[:15]:
-        terminal = row.get("terminal_name") or row.get("terminal") or "Unknown terminal"
+        system = row.get("system_name") or row.get("system") or row.get("star_system_name")
+        planet = row.get("planet_name") or row.get("planet")
+        moon = row.get("moon_name") or row.get("moon")
+        city = row.get("city_name") or row.get("city")
+
         buy = row.get("price_buy") or row.get("buy_price")
         sell = row.get("price_sell") or row.get("sell_price")
+        distance_gm = row.get("_distance_gm")
 
-        text = terminal
+        location_bits = [x for x in (system, planet, moon, city) if x]
+        location_suffix = f" ({' • '.join(location_bits)})" if location_bits else ""
 
+        extras: list[str] = []
+        if distance_gm is not None:
+            extras.append(f"{distance_gm:.2f} GM")
         if buy is not None:
-            text += f" | Buy {buy}"
-
+            extras.append(f"buy {buy}")
         if sell is not None:
-            text += f" | Sell {sell}"
+            extras.append(f"sell {sell}")
 
-        lines.append(text)
+        market_suffix = f" — {' | '.join(extras)}" if extras else ""
+        lines.append(f"{terminal}{location_suffix}{market_suffix}")
 
-    e.description = "\n".join(lines[:15])
-    e.set_footer(text=FOOTER)
-    return e
+    embed.description = _truncate_lines(lines, 3500)
+    embed.set_footer(text=FOOTER)
+    return embed
 
 
-def loadout_embed(report, query: str):
-    e = discord.Embed(title=f"🛠️ {query}")
-
+def loadout_embed(report: LoadoutReport | None, query: str) -> discord.Embed:
     if report is None:
-        e.description = "No ship data was returned by the Star Citizen Wiki API for that query."
-        e.set_footer(text=FOOTER)
-        return e
+        embed = discord.Embed(title=f"🛠️ {query}")
+        embed.description = "No ship data was returned by the Star Citizen Wiki API for that query."
+        embed.set_footer(text=FOOTER)
+        return embed
 
-    subtitle = []
+    embed = discord.Embed(title=f"🛠️ {report.ship_name}")
 
+    subtitle: list[str] = []
     if getattr(report, "role", None):
         subtitle.append(report.role)
-
     if getattr(report, "manufacturer", None):
         subtitle.append(report.manufacturer)
-
     if subtitle:
-        e.description = " • ".join(subtitle)
+        embed.description = " • ".join(subtitle)
 
-    e.add_field(name="Weapons", value="\n".join(report.weapons[:10]) or "None", inline=False)
-    e.add_field(name="Systems", value="\n".join(report.systems[:10]) or "None", inline=False)
-    e.add_field(name="Performance", value="\n".join(report.performance[:10]) or "None", inline=False)
+    weapons = getattr(report, "weapons", []) or []
+    systems = getattr(report, "systems", []) or []
+    performance = getattr(report, "performance", []) or []
+    notes = getattr(report, "notes", []) or []
 
-    if getattr(report, "notes", None):
-        e.add_field(name="Notes", value="\n".join(report.notes[:10]), inline=False)
+    embed.add_field(name="Weapons", value=_truncate_lines(weapons), inline=False)
+    embed.add_field(name="Systems", value=_truncate_lines(systems), inline=False)
+    embed.add_field(name="Performance", value=_truncate_lines(performance), inline=False)
+    if notes:
+        embed.add_field(name="Notes", value=_truncate_lines(notes), inline=False)
 
-    e.set_footer(text=FOOTER)
-    return e
+    embed.set_footer(text=FOOTER)
+    return embed
