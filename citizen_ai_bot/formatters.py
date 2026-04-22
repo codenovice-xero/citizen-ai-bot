@@ -153,4 +153,3 @@ def loadout_embed(report: LoadoutReport | None, query: str) -> discord.Embed:
 
     embed.set_footer(text=FOOTER)
     return embed
-
