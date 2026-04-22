@@ -13,6 +13,11 @@ log = logging.getLogger(__name__)
 
 _CACHE_TTL = 60 * 60 * 12  # 12 hours
 
+ITEM_ALIASES = {
+    "chaos iii": "khaos",
+    "chaos 3": "khaos",
+}
+
 
 class UEXClient:
     def __init__(self) -> None:
@@ -43,9 +48,7 @@ class UEXClient:
         return payload
 
     async def ping(self) -> bool:
-        # Use only documented parameter shapes.
         probes: list[tuple[str, dict[str, Any]]] = [
-            ("/commodities_prices", {"id_terminal": 1}),
             ("/items", {"id_category": 1}),
             ("/star_systems", {}),
         ]
@@ -65,8 +68,6 @@ class UEXClient:
 
         all_items: list[dict[str, Any]] = []
 
-        # /items requires a valid id_category.
-        # Pull a useful spread of categories and cache locally.
         for category_id in range(1, 31):
             try:
                 data = await self._get("/items", params={"id_category": category_id})
@@ -119,23 +120,26 @@ class UEXClient:
 
         ranked.sort(key=lambda x: x[0], reverse=True)
         best_score, best_item = ranked[0]
+        best_name = str(best_item.get("name", ""))
 
-        best_name = str(best_item.get("name", "")).lower()
-        if query_norm not in best_name and best_score < 70:
+        if best_score < 55:
             log.warning(
                 "Rejected weak UEX item match for %r: %r (score=%s)",
                 query,
-                best_item.get("name"),
+                best_name,
                 best_score,
             )
             return None
 
-        log.info("Resolved UEX item %r -> %r (id=%r)", query, best_item.get("name"), best_item.get("id"))
+        log.info("Resolved UEX item %r -> %r (id=%r)", query, best_name, best_item.get("id"))
         return best_item
 
     async def resolve_item(self, name: str) -> dict[str, Any] | None:
+        query = " ".join(name.lower().split())
+        alias = ITEM_ALIASES.get(query, name)
+
         items = await self._load_items_index()
-        return self._pick_best_item(name, items)
+        return self._pick_best_item(alias, items)
 
     async def get_item_locations(self, name: str) -> list[dict[str, Any]]:
         item = await self.resolve_item(name)
@@ -185,7 +189,6 @@ class UEXClient:
         return deduped
 
     async def price_snapshot(self, commodity: str) -> list[dict[str, Any]]:
-        # Leaving this as-is unless /trend needs deeper fixes.
         for path in ("/commodities_prices", "/commodities"):
             try:
                 data = await self._get(path, params={"search": commodity, "limit": 100})
