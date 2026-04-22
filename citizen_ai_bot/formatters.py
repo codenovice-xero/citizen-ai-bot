@@ -1,194 +1,86 @@
 from __future__ import annotations
+import discord
 
-import logging
-import time
-from typing import Any
-
-import httpx
-
-from .config import settings
-from .utils import fuzzy_score
-
-log = logging.getLogger(__name__)
-
-_CACHE_TTL = 60 * 60 * 12  # 12 hours
+FOOTER = "Citizen AI • Star Citizen Utility Bot"
 
 
-class UEXClient:
-    def __init__(self) -> None:
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "CitizenAI-DiscordBot/1.0",
-        }
-        if settings.uex_api_token:
-            headers["Authorization"] = f"Bearer {settings.uex_api_token}"
+def simple_embed(title: str, description: str):
+    e = discord.Embed(title=title, description=description)
+    e.set_footer(text=FOOTER)
+    return e
 
-        self._http = httpx.AsyncClient(
-            base_url=settings.uex_api_base.rstrip("/"),
-            timeout=20.0,
-            follow_redirects=True,
-            headers=headers,
-        )
 
-        self._items_cache: tuple[float, list[dict[str, Any]]] | None = None
+def status_embed(status: dict):
+    ok = status.get("overall", False)
 
-    async def close(self) -> None:
-        await self._http.aclose()
+    e = discord.Embed(
+        title="🟢 Citizen AI Status" if ok else "🟡 Citizen AI Status",
+        description="All systems operational." if ok else "One or more providers unreachable."
+    )
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = await self._http.get(path, params=params)
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and "data" in payload:
-            return payload["data"]
-        return payload
+    e.add_field(name="Bot", value="Online", inline=True)
+    e.add_field(name="UEX", value="Reachable" if status.get("uex_api") else "Unreachable", inline=True)
+    e.add_field(name="Wiki", value="Reachable" if status.get("wiki_api") else "Unreachable", inline=True)
 
-    async def ping(self) -> bool:
-        for path in ("/commodities_prices", "/items", "/star_systems"):
-            try:
-                # /items requires a valid filter, so only use params there
-                params = {"limit": 1}
-                if path == "/items":
-                    params = {"id_category": 1}
-                data = await self._get(path, params=params)
-                if data is not None:
-                    return True
-            except Exception as exc:
-                log.debug("UEX ping failed on %s: %s", path, exc)
-        return False
+    e.set_footer(text=FOOTER)
+    return e
 
-    async def _load_items_index(self) -> list[dict[str, Any]]:
-        now = time.monotonic()
-        if self._items_cache and (now - self._items_cache[0]) < _CACHE_TTL:
-            return self._items_cache[1]
 
-        all_items: list[dict[str, Any]] = []
+def item_embed(item_name: str, rows: list):
+    e = discord.Embed(title=f"📦 {item_name}")
 
-        # UEX /items requires a category filter.
-        # Pull a useful spread of likely component/weapon categories.
-        # These category ids may not cover every item in UEX, but they are far better
-        # than unsupported free-text search and work with the documented API contract.
-        category_ids = list(range(1, 21))
+    if not rows:
+        e.description = "No item data was returned for that query."
+        e.set_footer(text=FOOTER)
+        return e
 
-        for category_id in category_ids:
-            try:
-                data = await self._get("/items", params={"id_category": category_id})
-                if isinstance(data, list):
-                    all_items.extend(x for x in data if isinstance(x, dict))
-            except Exception as exc:
-                log.debug("UEX items index load failed for category %s: %s", category_id, exc)
+    lines = []
 
-        # dedupe by id
-        deduped: dict[int, dict[str, Any]] = {}
-        for item in all_items:
-            item_id = item.get("id")
-            if isinstance(item_id, int):
-                deduped[item_id] = item
+    for row in rows[:15]:
+        terminal = row.get("terminal_name") or row.get("terminal") or "Unknown terminal"
+        buy = row.get("price_buy") or row.get("buy_price")
+        sell = row.get("price_sell") or row.get("sell_price")
 
-        result = list(deduped.values())
-        self._items_cache = (now, result)
-        return result
+        text = terminal
 
-    def _pick_best_item(self, query: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:
-        ranked: list[tuple[float, dict[str, Any]]] = []
-        query_norm = " ".join(query.lower().split())
+        if buy is not None:
+            text += f" | Buy {buy}"
 
-        for item in items:
-            names = [
-                item.get("name"),
-                item.get("slug"),
-                item.get("uuid"),
-                item.get("category"),
-                item.get("section"),
-            ]
-            names = [str(x) for x in names if x]
+        if sell is not None:
+            text += f" | Sell {sell}"
 
-            if not names:
-                continue
+        lines.append(text)
 
-            score = max(fuzzy_score(query, name) for name in names)
+    e.description = "\n".join(lines[:15])
+    e.set_footer(text=FOOTER)
+    return e
 
-            lowered_names = [name.lower() for name in names]
-            if any(query_norm == name for name in lowered_names):
-                score += 40
-            if any(query_norm in name for name in lowered_names):
-                score += 20
 
-            ranked.append((score, item))
+def loadout_embed(report, query: str):
+    e = discord.Embed(title=f"🛠️ {query}")
 
-        if not ranked:
-            return None
+    if report is None:
+        e.description = "No ship data was returned by the Star Citizen Wiki API for that query."
+        e.set_footer(text=FOOTER)
+        return e
 
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_item = ranked[0]
+    subtitle = []
 
-        # reject weak garbage matches
-        best_name = str(best_item.get("name", "")).lower()
-        if query_norm not in best_name and best_score < 70:
-            log.warning("Rejected weak UEX item match for %r: %r (score=%s)", query, best_item.get("name"), best_score)
-            return None
+    if getattr(report, "role", None):
+        subtitle.append(report.role)
 
-        return best_item
+    if getattr(report, "manufacturer", None):
+        subtitle.append(report.manufacturer)
 
-    async def resolve_item(self, name: str) -> dict[str, Any] | None:
-        items = await self._load_items_index()
-        return self._pick_best_item(name, items)
+    if subtitle:
+        e.description = " • ".join(subtitle)
 
-    async def get_item_locations(self, name: str) -> list[dict[str, Any]]:
-        item = await self.resolve_item(name)
-        if not item:
-            return []
+    e.add_field(name="Weapons", value="\n".join(report.weapons[:10]) or "None", inline=False)
+    e.add_field(name="Systems", value="\n".join(report.systems[:10]) or "None", inline=False)
+    e.add_field(name="Performance", value="\n".join(report.performance[:10]) or "None", inline=False)
 
-        item_id = item.get("id")
-        item_uuid = item.get("uuid")
+    if getattr(report, "notes", None):
+        e.add_field(name="Notes", value="\n".join(report.notes[:10]), inline=False)
 
-        rows: list[dict[str, Any]] = []
-
-        # items_prices supports id_item or uuid
-        lookup_attempts = []
-        if item_id is not None:
-            lookup_attempts.append({"id_item": item_id})
-        if item_uuid:
-            lookup_attempts.append({"uuid": item_uuid})
-
-        for params in lookup_attempts:
-            try:
-                data = await self._get("/items_prices", params=params)
-                if isinstance(data, list) and data:
-                    rows.extend(x for x in data if isinstance(x, dict))
-                    break
-            except Exception as exc:
-                log.debug("UEX item price lookup failed for %s: %s", params, exc)
-
-        seen = set()
-        deduped: list[dict[str, Any]] = []
-        for row in rows:
-            key = (
-                row.get("id"),
-                row.get("id_item"),
-                row.get("id_terminal"),
-                row.get("terminal_name"),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(row)
-
-        # sort best-looking rows first
-        deduped.sort(
-            key=lambda row: (
-                row.get("price_buy") is None and row.get("price_sell") is None,
-                row.get("terminal_name") or "",
-            )
-        )
-        return deduped
-
-    async def price_snapshot(self, commodity: str) -> list[dict[str, Any]]:
-        for path in ("/commodities_prices", "/commodities"):
-            try:
-                data = await self._get(path, params={"search": commodity, "limit": 100})
-                if isinstance(data, list):
-                    return [x for x in data if isinstance(x, dict)]
-            except Exception as exc:
-                log.debug("UEX price snapshot failed on %s: %s", path, exc)
-        return []
+    e.set_footer(text=FOOTER)
+    return e
