@@ -48,6 +48,7 @@ class UEXClient:
         )
         self._items_cache: tuple[float, list[dict[str, Any]]] | None = None
         self._terminals_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._distance_cache: dict[tuple[int, int], tuple[float, float | None]] = {}
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -203,19 +204,19 @@ class UEXClient:
         query = _normalize_text(location)
 
         terminal_aliases = {
-            "orison": "Seraphim",
-            "seraphim": "Seraphim",
+            "orison": "Seraphim Station",
+            "seraphim": "Seraphim Station",
+            "port tressler": "Port Tressler",
+            "tressler": "Port Tressler",
+            "everus": "Everus Harbor",
+            "everus harbor": "Everus Harbor",
+            "grimhex": "GrimHEX",
+            "grim hex": "GrimHEX",
             "area18": "Area 18",
             "area 18": "Area 18",
             "new babbage": "New Babbage",
             "nb": "New Babbage",
             "lorville": "Lorville",
-            "everus": "Everus Harbor",
-            "everus harbor": "Everus Harbor",
-            "port tressler": "Port Tressler",
-            "tressler": "Port Tressler",
-            "grimhex": "GrimHEX",
-            "grim hex": "GrimHEX",
         }
 
         search_term = terminal_aliases.get(query, location)
@@ -247,6 +248,7 @@ class UEXClient:
 
             norm_names = [_normalize_text(n) for n in names]
             compact_names = [_compact_text(n) for n in names]
+            lower_name = " ".join(norm_names)
 
             if any(search_norm == n for n in norm_names):
                 score += 50
@@ -255,6 +257,14 @@ class UEXClient:
             if any(search_compact == n for n in compact_names):
                 score += 40
             if any(search_compact in n for n in compact_names):
+                score += 15
+
+            # Prefer the actual station over admin/shop terminals when user means a location.
+            if "admin" in lower_name:
+                score -= 40
+            if "cargo" in lower_name or "factory line" in lower_name:
+                score -= 20
+            if "station" in lower_name or "harbor" in lower_name or "port" in lower_name:
                 score += 15
 
             ranked.append((score, terminal))
@@ -274,49 +284,36 @@ class UEXClient:
         )
         return best_terminal
 
-    async def get_terminal_distances(self, origin_terminal_id: int) -> dict[str, float]:
-        distance_map: dict[str, float] = {}
+    async def get_terminal_distance(self, origin_terminal_id: int, destination_terminal_id: int) -> float | None:
+        cache_key = (origin_terminal_id, destination_terminal_id)
+        now = time.monotonic()
+        cached = self._distance_cache.get(cache_key)
+        if cached and (now - cached[0]) < _CACHE_TTL:
+            return cached[1]
 
-        attempts = [
-            {"id_terminal_origin": origin_terminal_id},
-            {"id_terminal": origin_terminal_id},
-            {"id_terminal_from": origin_terminal_id},
-        ]
+        params = {
+            "id_terminal_origin": origin_terminal_id,
+            "id_terminal_destination": destination_terminal_id,
+        }
 
-        for params in attempts:
+        try:
+            data = await self._get("/terminals_distances", params=params)
+        except Exception as exc:
+            log.debug("UEX terminal distance lookup failed for %s: %s", params, exc)
+            self._distance_cache[cache_key] = (now, None)
+            return None
+
+        distance: float | None = None
+        if isinstance(data, dict):
+            raw = data.get("distance")
             try:
-                data = await self._get("/terminals_distances", params=params)
-            except Exception as exc:
-                log.debug("UEX terminal distance lookup failed for %s: %s", params, exc)
-                continue
+                if raw is not None:
+                    distance = float(raw)
+            except Exception:
+                distance = None
 
-            if not isinstance(data, list):
-                continue
-
-            for row in data:
-                if not isinstance(row, dict):
-                    continue
-
-                dest_id = (
-                    row.get("id_terminal_destination")
-                    or row.get("id_terminal_to")
-                    or row.get("id_terminal")
-                    or row.get("terminal_id")
-                )
-                distance = row.get("distance") or row.get("distance_gm") or row.get("dist")
-
-                try:
-                    if dest_id is not None and distance is not None:
-                        distance_map[str(dest_id)] = float(distance)
-                except Exception:
-                    continue
-
-            if distance_map:
-                log.info("Resolved %s terminal distances from %s", len(distance_map), origin_terminal_id)
-                return distance_map
-
-        log.warning("No terminal distance map returned for origin terminal %s", origin_terminal_id)
-        return {}
+        self._distance_cache[cache_key] = (now, distance)
+        return distance
 
     async def get_item_locations(self, name: str, location: str | None = None) -> list[dict[str, Any]]:
         item = await self.resolve_item(name)
@@ -358,10 +355,10 @@ class UEXClient:
             seen.add(key)
             deduped.append(row)
 
-        if not location:
-            for row in deduped:
-                row["_resolved_item"] = resolved_item_name
+        for row in deduped:
+            row["_resolved_item"] = resolved_item_name
 
+        if not location:
             deduped.sort(
                 key=lambda row: (
                     row.get("price_buy") is None and row.get("price_sell") is None,
@@ -373,14 +370,10 @@ class UEXClient:
         origin_terminal = await self.resolve_terminal(location)
         if not origin_terminal:
             log.warning("No UEX terminal resolved for location %r", location)
-            for row in deduped:
-                row["_resolved_item"] = resolved_item_name
             return deduped
 
         origin_terminal_id = origin_terminal.get("id")
         if origin_terminal_id is None:
-            for row in deduped:
-                row["_resolved_item"] = resolved_item_name
             return deduped
 
         resolved_location_name = (
@@ -389,16 +382,19 @@ class UEXClient:
             or origin_terminal.get("name")
         )
 
-        distance_map = await self.get_terminal_distances(int(origin_terminal_id))
-
         for row in deduped:
+            row["_resolved_location"] = resolved_location_name
             terminal_id = row.get("id_terminal")
             try:
-                row["_distance_gm"] = distance_map.get(str(terminal_id)) if terminal_id is not None else None
+                if terminal_id is not None:
+                    row["_distance_gm"] = await self.get_terminal_distance(
+                        int(origin_terminal_id),
+                        int(terminal_id),
+                    )
+                else:
+                    row["_distance_gm"] = None
             except Exception:
                 row["_distance_gm"] = None
-            row["_resolved_location"] = resolved_location_name
-            row["_resolved_item"] = resolved_item_name
 
         deduped.sort(
             key=lambda row: (
