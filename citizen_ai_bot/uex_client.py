@@ -47,6 +47,7 @@ class UEXClient:
             headers=headers,
         )
         self._items_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._terminals_cache: tuple[float, list[dict[str, Any]]] | None = None
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -79,7 +80,6 @@ class UEXClient:
             return self._items_cache[1]
 
         all_items: list[dict[str, Any]] = []
-
         for category_id in range(1, 31):
             try:
                 data = await self._get("/items", params={"id_category": category_id})
@@ -99,10 +99,31 @@ class UEXClient:
         log.info("Loaded %s items into local UEX index", len(result))
         return result
 
+    async def _load_terminals_index(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if self._terminals_cache and (now - self._terminals_cache[0]) < _CACHE_TTL:
+            return self._terminals_cache[1]
+
+        terminals: list[dict[str, Any]] = []
+        try:
+            data = await self._get("/terminals")
+            if isinstance(data, list):
+                terminals = [x for x in data if isinstance(x, dict)]
+        except Exception as exc:
+            log.debug("UEX full terminal lookup failed: %s", exc)
+
+        self._terminals_cache = (now, terminals)
+        log.info("Loaded %s terminals into local UEX index", len(terminals))
+        return terminals
+
     def _pick_best_item(self, query: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:
         ranked: list[tuple[float, dict[str, Any]]] = []
         query_norm = _normalize_text(query)
         query_compact = _compact_text(query)
+
+        weaponish_query = any(token in query_compact for token in [
+            "p4ar", "p4", "ar", "rifle", "gun", "smg", "shotgun", "sniper", "lmg", "pistol", "launcher"
+        ])
 
         for item in items:
             names = [
@@ -121,6 +142,7 @@ class UEXClient:
 
             norm_names = [_normalize_text(name) for name in names]
             compact_names = [_compact_text(name) for name in names]
+            item_name = str(item.get("name", ""))
 
             if any(query_norm == n for n in norm_names):
                 score += 45
@@ -130,6 +152,21 @@ class UEXClient:
                 score += 35
             if any(query_compact in n for n in compact_names):
                 score += 15
+
+            lower_name = item_name.lower()
+            compact_name = _compact_text(item_name)
+
+            if weaponish_query:
+                if "magazine" in lower_name or "ammo" in lower_name or "battery" in lower_name or "clip" in lower_name:
+                    score -= 40
+                if "rifle" in lower_name or "carbine" in lower_name or "smg" in lower_name or "pistol" in lower_name:
+                    score += 12
+
+            if query_compact == "p4ar":
+                if "p4ar" in compact_name and "magazine" not in lower_name:
+                    score += 60
+                if "magazine" in lower_name:
+                    score -= 60
 
             ranked.append((score, item))
 
@@ -182,29 +219,7 @@ class UEXClient:
         }
 
         search_term = terminal_aliases.get(query, location)
-        candidates: list[dict[str, Any]] = []
-
-        # broad terminal pull and local ranking works better than exact server-side matching
-        try:
-            data = await self._get("/terminals")
-            if isinstance(data, list):
-                candidates.extend(x for x in data if isinstance(x, dict))
-        except Exception as exc:
-            log.debug("UEX full terminal lookup failed: %s", exc)
-
-        if not candidates:
-            for params in (
-                {"name": search_term},
-                {"fullname": search_term},
-                {"displayname": search_term},
-            ):
-                try:
-                    data = await self._get("/terminals", params=params)
-                    if isinstance(data, list):
-                        candidates.extend(x for x in data if isinstance(x, dict))
-                except Exception as exc:
-                    log.debug("UEX terminal lookup failed for %s: %s", params, exc)
-
+        candidates = await self._load_terminals_index()
         if not candidates:
             return None
 
@@ -259,10 +274,9 @@ class UEXClient:
         )
         return best_terminal
 
-    async def get_terminal_distances(self, origin_terminal_id: int) -> dict[int, float]:
-        distance_map: dict[int, float] = {}
+    async def get_terminal_distances(self, origin_terminal_id: int) -> dict[str, float]:
+        distance_map: dict[str, float] = {}
 
-        # Try multiple plausible parameter names / endpoint shapes.
         attempts = [
             {"id_terminal_origin": origin_terminal_id},
             {"id_terminal": origin_terminal_id},
@@ -293,7 +307,7 @@ class UEXClient:
 
                 try:
                     if dest_id is not None and distance is not None:
-                        distance_map[int(dest_id)] = float(distance)
+                        distance_map[str(dest_id)] = float(distance)
                 except Exception:
                     continue
 
@@ -380,7 +394,7 @@ class UEXClient:
         for row in deduped:
             terminal_id = row.get("id_terminal")
             try:
-                row["_distance_gm"] = distance_map.get(int(terminal_id)) if terminal_id is not None else None
+                row["_distance_gm"] = distance_map.get(str(terminal_id)) if terminal_id is not None else None
             except Exception:
                 row["_distance_gm"] = None
             row["_resolved_location"] = resolved_location_name
@@ -394,7 +408,6 @@ class UEXClient:
             )
         )
 
-        # helpful debug sample
         if deduped:
             preview = [
                 (
