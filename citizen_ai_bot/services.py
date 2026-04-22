@@ -79,8 +79,8 @@ class StarCitizenService:
 
         return " | ".join(parts)
 
-    async def suggest_loadout(self, ship_name: str):
-        return await self.wiki.build_loadout_report(ship_name)
+    async def suggest_loadout(self, ship_name: str, role: str | None = None):
+        return await self.wiki.build_loadout_report(ship_name, requested_role=role)
 
     async def suggest_mining(self, ship_name: str | None = None) -> str:
         return (
