@@ -1,21 +1,21 @@
-from __future__ import annotations
-
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    discord_token: str = Field(default="", alias="DISCORD_TOKEN")
-    discord_guild_id: int | None = Field(default=None, alias="DISCORD_GUILD_ID")
-    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-    uex_api_token: str | None = Field(default=None, alias="UEX_API_TOKEN")
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
+        extra="ignore"
     )
+
+    discord_token: str = ""
+    discord_guild_id: int | None = None
+    log_level: str = "INFO"
+
+    uex_api_base: str = "https://api.uexcorp.space/2.0"
+    uex_api_token: str = ""
+
+    wiki_api_base: str = "https://api.star-citizen.wiki"
 
 
 settings = Settings()
