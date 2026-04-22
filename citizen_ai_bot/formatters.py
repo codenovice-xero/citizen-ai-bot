@@ -52,19 +52,29 @@ def status_embed(status: dict[str, bool]) -> discord.Embed:
     return embed
 
 
-def item_embed(item_name: str, rows: list[dict], location: str | None = None, resolved_location: str | None = None) -> discord.Embed:
+def item_embed(
+    item_name: str,
+    rows: list[dict],
+    location: str | None = None,
+    resolved_location: str | None = None,
+) -> discord.Embed:
     title = f"📦 {item_name}"
     if location:
         title += f" • from {location}"
 
     embed = discord.Embed(title=title)
 
+    resolved_item = rows[0].get("_resolved_item") if rows else None
+
+    header_lines: list[str] = []
+    if resolved_item:
+        header_lines.append(f"Resolved item: {resolved_item}")
     if resolved_location:
-        embed.description = f"Resolved origin: {resolved_location}"
+        header_lines.append(f"Resolved origin: {resolved_location}")
 
     if not rows:
-        if resolved_location:
-            embed.description = f"{embed.description}\n\nNo item data was returned for that query."
+        if header_lines:
+            embed.description = "\n".join(header_lines) + "\n\nNo item data was returned for that query."
         else:
             embed.description = "No item data was returned for that query."
         embed.set_footer(text=FOOTER)
@@ -92,19 +102,20 @@ def item_embed(item_name: str, rows: list[dict], location: str | None = None, re
         location_suffix = f" ({' • '.join(location_bits)})" if location_bits else ""
 
         extras: list[str] = []
-        if distance_gm is not None:
-            extras.append(f"{distance_gm:.2f} GM")
         if buy is not None:
             extras.append(f"buy {buy}")
         if sell is not None:
             extras.append(f"sell {sell}")
+        if distance_gm is not None:
+            extras.append(f"{distance_gm:.2f} GM")
 
         market_suffix = f" — {' | '.join(extras)}" if extras else ""
         lines.append(f"{terminal}{location_suffix}{market_suffix}")
 
     body = _truncate_lines(lines, 3500)
-    if embed.description:
-        embed.description = f"{embed.description}\n\n{body}"
+
+    if header_lines:
+        embed.description = "\n".join(header_lines) + "\n\n" + body
     else:
         embed.description = body
 
@@ -142,3 +153,4 @@ def loadout_embed(report: LoadoutReport | None, query: str) -> discord.Embed:
 
     embed.set_footer(text=FOOTER)
     return embed
+
