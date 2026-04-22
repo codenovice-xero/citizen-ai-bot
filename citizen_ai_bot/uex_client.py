@@ -149,7 +149,13 @@ class UEXClient:
             )
             return None
 
-        log.info("Resolved UEX item %r -> %r (id=%r, score=%s)", query, best_name, best_item.get("id"), best_score)
+        log.info(
+            "Resolved UEX item %r -> %r (id=%r, score=%s)",
+            query,
+            best_name,
+            best_item.get("id"),
+            best_score,
+        )
         return best_item
 
     async def resolve_item(self, name: str) -> dict[str, Any] | None:
@@ -277,6 +283,7 @@ class UEXClient:
             log.warning("No UEX item resolved for query %r", name)
             return []
 
+        resolved_item_name = item.get("name") or item.get("slug") or name
         item_id = item.get("id")
         item_uuid = item.get("uuid")
 
@@ -311,6 +318,9 @@ class UEXClient:
             deduped.append(row)
 
         if not location:
+            for row in deduped:
+                row["_resolved_item"] = resolved_item_name
+
             deduped.sort(
                 key=lambda row: (
                     row.get("price_buy") is None and row.get("price_sell") is None,
@@ -322,10 +332,14 @@ class UEXClient:
         origin_terminal = await self.resolve_terminal(location)
         if not origin_terminal:
             log.warning("No UEX terminal resolved for location %r", location)
+            for row in deduped:
+                row["_resolved_item"] = resolved_item_name
             return deduped
 
         origin_terminal_id = origin_terminal.get("id")
         if origin_terminal_id is None:
+            for row in deduped:
+                row["_resolved_item"] = resolved_item_name
             return deduped
 
         resolved_location_name = (
@@ -343,6 +357,7 @@ class UEXClient:
             except Exception:
                 row["_distance_gm"] = None
             row["_resolved_location"] = resolved_location_name
+            row["_resolved_item"] = resolved_item_name
 
         deduped.sort(
             key=lambda row: (
