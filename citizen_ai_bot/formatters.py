@@ -21,6 +21,23 @@ def _truncate_lines(lines: list[str], max_len: int = 1000) -> str:
     return "\n".join(out) if out else "No data."
 
 
+def _dedupe_keep_order(values: list[str | None]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        cleaned = str(value).strip()
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
+
+
 def simple_embed(title: str, description: str) -> discord.Embed:
     embed = discord.Embed(title=title, description=description)
     embed.set_footer(text=FOOTER)
@@ -98,7 +115,7 @@ def item_embed(
         sell = row.get("price_sell") or row.get("sell_price")
         distance_gm = row.get("_distance_gm")
 
-        location_bits = [x for x in (system, planet, moon, city) if x]
+        location_bits = _dedupe_keep_order([system, planet, moon, city])
         location_suffix = f" ({' • '.join(location_bits)})" if location_bits else ""
 
         extras: list[str] = []
