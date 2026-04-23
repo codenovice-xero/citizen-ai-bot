@@ -281,6 +281,38 @@ def _is_system_candidate(item: dict[str, Any], category: str) -> bool:
     return any(term in name for term in allowed)
 
 
+def _is_clean_system_item(item: dict[str, Any], category: str) -> bool:
+    if not _is_system_candidate(item, category):
+        return False
+
+    name = str(item.get("name") or item.get("title") or item.get("class_name") or "").strip()
+    if not name:
+        return False
+
+    item_class = str(
+        item.get("sub_type")
+        or item.get("type")
+        or item.get("classification")
+        or item.get("class_name")
+        or ""
+    ).strip()
+
+    if not item_class or item_class.lower() in {"undefined", "none", "unknown", "tbd"}:
+        return False
+
+    blob = _classification_blob(item)
+    class_blob = item_class.lower()
+
+    if category == "shields" and "shield" not in blob and "shield" not in class_blob:
+        return False
+    if category == "power" and "power" not in blob and "power" not in class_blob:
+        return False
+    if category == "coolers" and "cooler" not in blob and "cooling" not in blob and "cooler" not in class_blob:
+        return False
+
+    return True
+
+
 class WikiClient:
     def __init__(self, timeout: float = 20.0) -> None:
         self._http = httpx.AsyncClient(
@@ -587,13 +619,13 @@ class WikiClient:
                 continue
             detail = await self._fetch_item_detail(str(candidate.get("uuid") or candidate.get("id") or ""))
             item = detail or candidate
-            if not _is_system_candidate(item, category):
+            if not _is_clean_system_item(item, category):
                 continue
             score = float(fuzzy_score(term, str(item.get("name") or "")))
             if score > best_score:
                 best_score = score
                 best = item
-        if best is None:
+        if best is None or not _is_clean_system_item(best, category):
             best = CURATED_SYSTEMS.get(category, {}).get(size)
         return best
 
@@ -614,6 +646,8 @@ class WikiClient:
         size = item.get("size")
         grade = item.get("grade")
         item_class = item.get("sub_type") or item.get("type") or item.get("classification")
+        if isinstance(item_class, str) and item_class.strip().lower() in {"undefined", "none", "unknown", "tbd"}:
+            item_class = None
         attrs: list[str] = []
         if size is not None:
             attrs.append(f"Size {size}")
