@@ -85,12 +85,15 @@ class SelectedItem:
     item_class: str
     grade: str | None = None
     count: int = 1
+    component_class: str | None = None
     dps: float | None = None
     alpha: float | None = None
 
     def line(self) -> str:
         prefix = f"{self.count}x " if self.count > 1 else ""
         attrs = [f"Size {self.size}", f"Class {self.item_class}"]
+        if self.component_class and self.component_class.lower() != self.item_class.lower():
+            attrs.append(f"Type {self.component_class}")
         if self.grade:
             attrs.append(f"Grade {self.grade}")
         if self.dps is not None:
@@ -116,7 +119,6 @@ class LoadoutEngine:
         if query in SHIP_ALIASES:
             return SHIP_ALIASES[query]
 
-        # Last-pass fuzzy-ish contains matching without external dependency.
         for key, ship in self.ship_db.items():
             display = _norm(ship.get("display_name"))
             if query == display or query in display or display in query:
@@ -164,8 +166,35 @@ class LoadoutEngine:
             alpha=item.get("alpha"),
         )
 
-    def select_system(self, category: str, size: int, count: int) -> SelectedItem | None:
-        item = (self.component_db.get("systems", {}).get(category, {}) or {}).get(str(size))
+    def _profile_for_category(self, role: str, category: str) -> str:
+        profile = ROLE_SYSTEM_PROFILE.get(role, ROLE_SYSTEM_PROFILE["multirole"])
+        if category == "shields":
+            return profile["shield"]
+        if category == "power":
+            return profile["power"]
+        if category == "coolers":
+            return profile["cooler"]
+        return "balanced"
+
+    def _resolve_profile_item(self, category: str, size: int, role: str) -> dict[str, Any] | None:
+        by_size = (self.component_db.get("systems", {}).get(category, {}) or {}).get(str(size))
+        if by_size is None:
+            return None
+
+        if "name" in by_size:
+            return by_size
+
+        wanted_profile = self._profile_for_category(role, category)
+        return (
+            by_size.get(wanted_profile)
+            or by_size.get("balanced")
+            or by_size.get("military")
+            or by_size.get("reliable")
+            or next(iter(by_size.values()), None)
+        )
+
+    def select_system(self, category: str, size: int, count: int, role: str) -> SelectedItem | None:
+        item = self._resolve_profile_item(category, size, role)
         if item is None:
             return None
         return SelectedItem(
@@ -174,6 +203,7 @@ class LoadoutEngine:
             item_class=item["class"],
             grade=item.get("grade"),
             count=count,
+            component_class=item.get("component_class"),
         )
 
     def select_missile(self, size: int, count: int) -> SelectedItem | None:
@@ -224,7 +254,7 @@ class LoadoutEngine:
             for slot in hardpoints.get(category, []):
                 counts[int(slot.get("size", 0))] += int(slot.get("count", 1))
             for size, count in sorted(counts.items()):
-                item = self.select_system(category, size, count)
+                item = self.select_system(category, size, count, selected_role)
                 if item:
                     systems.append(item)
 
@@ -275,7 +305,7 @@ class LoadoutEngine:
             f"Recommended role profile: {ROLE_DISPLAY[selected_role]}",
             f"System profile: shields={role_profile['shield']} • power={role_profile['power']} • cooling={role_profile['cooler']}",
             *hardpoint_notes,
-            "Loadout v3 uses internal ship hardpoints for correctness and component recommendations for consistency. APIs can still enrich stats later.",
+            "Loadout v3.1 uses role-aware system profiles so S1 ships no longer recommend S2-only modules.",
         ]
 
         return LoadoutReport(
