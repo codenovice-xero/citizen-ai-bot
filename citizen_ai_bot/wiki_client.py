@@ -40,9 +40,7 @@ SHIP_ALIASES = {
     "drake cutlass blue": "Cutlass Blue",
 }
 
-HARD_UUID_LOOKUPS = {
-    "shiv": "3a7bfe4f-7a6c-4818-aba8-0f1019c3a647",
-}
+HARD_UUID_LOOKUPS = {"shiv": "3a7bfe4f-7a6c-4818-aba8-0f1019c3a647"}
 
 ROLE_HINTS = {
     "fighter": "combat",
@@ -123,41 +121,13 @@ CURATED_WEAPONS = {
 }
 
 SYSTEM_TERMS = {
-    "combat": {
-        "shields": {1: ["FR-66", "Mirage"], 2: ["FR-76"], 3: ["FR-86"]},
-        "power": {1: ["JS-300"], 2: ["JS-400"], 3: ["JS-500"]},
-        "coolers": {1: ["Snowpack"], 2: ["Snowblind"], 3: ["AbsoluteZero"]},
-    },
-    "interceptor": {
-        "shields": {1: ["Mirage", "FR-66"], 2: ["FR-76"]},
-        "power": {1: ["JS-300"], 2: ["JS-400"]},
-        "coolers": {1: ["Snowpack"], 2: ["Snowblind"]},
-    },
-    "heavy_fighter": {
-        "shields": {1: ["FR-66"], 2: ["FR-76"], 3: ["FR-86"]},
-        "power": {1: ["JS-300"], 2: ["JS-400"], 3: ["JS-500"]},
-        "coolers": {1: ["Snowpack"], 2: ["Snowblind"], 3: ["AbsoluteZero"]},
-    },
-    "stealth": {
-        "shields": {1: ["Mirage"], 2: ["Sukoran"]},
-        "power": {1: ["Regulus"], 2: ["Regulus"]},
-        "coolers": {1: ["UltraFlow"], 2: ["Eco-Flow"]},
-    },
-    "exploration": {
-        "shields": {1: ["Palisade", "FR-66"], 2: ["Palisade", "FR-76"]},
-        "power": {1: ["JS-300"], 2: ["JS-400"]},
-        "coolers": {1: ["Snowpack"], 2: ["Snowblind"]},
-    },
-    "multirole": {
-        "shields": {1: ["Palisade", "FR-66"], 2: ["Palisade", "FR-76"]},
-        "power": {1: ["JS-300"], 2: ["JS-400"]},
-        "coolers": {1: ["Snowpack"], 2: ["Snowblind"]},
-    },
-    "cargo": {
-        "shields": {1: ["Palisade", "FR-66"], 2: ["Palisade", "FR-76"], 3: ["FR-86"]},
-        "power": {1: ["JS-300"], 2: ["JS-400"], 3: ["JS-500"]},
-        "coolers": {1: ["Snowpack"], 2: ["Snowblind"], 3: ["AbsoluteZero"]},
-    },
+    "combat": {"shields": {1: ["FR-66", "Mirage"], 2: ["FR-76"], 3: ["FR-86"]}, "power": {1: ["JS-300"], 2: ["JS-400"], 3: ["JS-500"]}, "coolers": {1: ["Snowpack"], 2: ["Snowblind"], 3: ["AbsoluteZero"]}},
+    "interceptor": {"shields": {1: ["Mirage", "FR-66"], 2: ["FR-76"]}, "power": {1: ["JS-300"], 2: ["JS-400"]}, "coolers": {1: ["Snowpack"], 2: ["Snowblind"]}},
+    "heavy_fighter": {"shields": {1: ["FR-66"], 2: ["FR-76"], 3: ["FR-86"]}, "power": {1: ["JS-300"], 2: ["JS-400"], 3: ["JS-500"]}, "coolers": {1: ["Snowpack"], 2: ["Snowblind"], 3: ["AbsoluteZero"]}},
+    "stealth": {"shields": {1: ["Mirage"], 2: ["Sukoran"]}, "power": {1: ["Regulus"], 2: ["Regulus"]}, "coolers": {1: ["UltraFlow"], 2: ["Eco-Flow"]}},
+    "exploration": {"shields": {1: ["Palisade", "FR-66"], 2: ["Palisade", "FR-76"]}, "power": {1: ["JS-300"], 2: ["JS-400"]}, "coolers": {1: ["Snowpack"], 2: ["Snowblind"]}},
+    "multirole": {"shields": {1: ["Palisade", "FR-66"], 2: ["Palisade", "FR-76"]}, "power": {1: ["JS-300"], 2: ["JS-400"]}, "coolers": {1: ["Snowpack"], 2: ["Snowblind"]}},
+    "cargo": {"shields": {1: ["Palisade", "FR-66"], 2: ["Palisade", "FR-76"], 3: ["FR-86"]}, "power": {1: ["JS-300"], 2: ["JS-400"], 3: ["JS-500"]}, "coolers": {1: ["Snowpack"], 2: ["Snowblind"], 3: ["AbsoluteZero"]}},
 }
 
 CURATED_SYSTEMS = {
@@ -180,23 +150,109 @@ CURATED_SYSTEMS = {
 
 WEAPON_ALLOW = ("weapon", "gun", "cannon", "repeater", "gatling", "distortion", "scattergun")
 WEAPON_REJECT = ("missile", "rack", "cooler", "power", "shield", "mount", "utility", "ammo", "countermeasure", "bomb", "torpedo")
-SYSTEM_ALLOW = {
-    "shields": ("shield",),
-    "power": ("power",),
-    "coolers": ("cooler", "cooling"),
-}
+SYSTEM_ALLOW = {"shields": ("shield",), "power": ("power",), "coolers": ("cooler", "cooling")}
 SYSTEM_REJECT = ("weapon", "gun", "cannon", "repeater", "gatling", "missile", "rack", "ammo", "bomb", "torpedo")
 
 
+def _norm(text: str | None) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _slug(text: str | None) -> str:
+    return _norm(text).replace(" ", "-")
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _first_non_empty(*values: Any) -> Any | None:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+            continue
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, dict) and value:
+            return value
+        if isinstance(value, list) and value:
+            return value
+    return None
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_int(value: Any) -> int | None:
+    num = _to_float(value)
+    return int(num) if num is not None else None
+
+
+def _fmt_num(value: float | int | None, digits: int = 0) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:,.{digits}f}"
+
+
+def _titleize(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.replace("_", " ").replace("-", " ").strip()
+    if not text:
+        return None
+    return " ".join(part.capitalize() if part.islower() or part.isupper() else part for part in text.split())
+
+
+def _manufacturer_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _first_non_empty(value.get("name"), value.get("short_name"), value.get("code"))
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def _clean_placeholder_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    bad_exact = {"weapon", "weapons", "missile", "missiles", "shield generator", "shield generators", "power plant", "power plants", "cooler", "coolers", "tbd", "unknown"}
+    lowered = cleaned.lower().replace(" ", "")
+    if cleaned.lower() in bad_exact:
+        return None
+    if lowered.startswith(("rsiweapon", "rsimodular", "vehicleitem")):
+        return None
+    return cleaned
+
+
 def _classification_blob(item: dict[str, Any]) -> str:
-    vals = [
-        item.get("classification"),
-        item.get("type"),
-        item.get("sub_type"),
-        item.get("class_name"),
-        item.get("category"),
-        item.get("section"),
-    ]
+    vals = [item.get("classification"), item.get("type"), item.get("sub_type"), item.get("class_name"), item.get("category"), item.get("section")]
     return " ".join(str(v).lower() for v in vals if v)
 
 
@@ -269,10 +325,7 @@ class WikiClient:
         return None
 
     def _vehicle_detail_paths(self, identifier: str) -> list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]]:
-        return [
-            ("GET", f"/api/vehicles/{identifier}", None, None),
-            ("GET", f"/api/v3/vehicles/{identifier}", None, None),
-        ]
+        return [("GET", f"/api/vehicles/{identifier}", None, None), ("GET", f"/api/v3/vehicles/{identifier}", None, None)]
 
     async def search_vehicle(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         key = _norm(query)
@@ -282,11 +335,7 @@ class WikiClient:
         cached = self._search_cache.get(key)
         if cached and (now - cached[0]) < _CACHE_TTL:
             return cached[1]
-
-        attempts = [
-            ("GET", "/api/vehicles", {"search": query, "limit": limit}, None),
-            ("GET", "/api/v3/vehicles", {"search": query, "limit": limit}, None),
-        ]
+        attempts = [("GET", "/api/vehicles", {"search": query, "limit": limit}, None), ("GET", "/api/v3/vehicles", {"search": query, "limit": limit}, None)]
         results: list[dict[str, Any]] = []
         for method, path, params, json in attempts:
             try:
@@ -299,7 +348,6 @@ class WikiClient:
                     break
             except Exception:
                 continue
-
         self._search_cache[key] = (now, results)
         return results
 
@@ -438,14 +486,7 @@ class WikiClient:
 
     def _extract_weapon_port_sizes(self, vehicle: dict[str, Any]) -> list[int]:
         name = _norm(str(vehicle.get("name") or vehicle.get("game_name") or ""))
-        curated = {
-            "cutlass blue": [3, 3, 3, 3],
-            "arrow": [3, 3, 3, 3],
-            "gladius": [3, 3, 3],
-            "shiv": [4, 4],
-            "sabre": [3, 3, 3, 3],
-            "vanguard warden": [5, 2, 2, 2, 2],
-        }
+        curated = {"cutlass blue": [3, 3, 3, 3], "arrow": [3, 3, 3, 3], "gladius": [3, 3, 3], "shiv": [4, 4], "sabre": [3, 3, 3, 3], "vanguard warden": [5, 2, 2, 2, 2]}
         return curated.get(name, [])
 
     def _extract_system_sizes(self, vehicle: dict[str, Any]) -> dict[str, list[int]]:
@@ -466,12 +507,7 @@ class WikiClient:
         cached = self._item_search_cache.get(key)
         if cached and (now - cached[0]) < _CACHE_TTL:
             return cached[1]
-        attempts = [
-            ("GET", "/api/items", {"search": term, "filter[category]": category, "limit": limit}, None),
-            ("GET", "/api/items", {"search": term, "limit": limit}, None),
-            ("GET", "/api/v3/items", {"search": term, "filter[category]": category, "limit": limit}, None),
-            ("GET", "/api/v3/items", {"search": term, "limit": limit}, None),
-        ]
+        attempts = [("GET", "/api/items", {"search": term, "filter[category]": category, "limit": limit}, None), ("GET", "/api/items", {"search": term, "limit": limit}, None), ("GET", "/api/v3/items", {"search": term, "filter[category]": category, "limit": limit}, None), ("GET", "/api/v3/items", {"search": term, "limit": limit}, None)]
         results: list[dict[str, Any]] = []
         for method, path, params, json in attempts:
             try:
@@ -488,10 +524,7 @@ class WikiClient:
         return results
 
     async def _fetch_item_detail(self, uuid_or_id: str) -> dict[str, Any] | None:
-        attempts = [
-            ("GET", f"/api/items/{uuid_or_id}", None, None),
-            ("GET", f"/api/v3/items/{uuid_or_id}", None, None),
-        ]
+        attempts = [("GET", f"/api/items/{uuid_or_id}", None, None), ("GET", f"/api/v3/items/{uuid_or_id}", None, None)]
         data = await self._try_paths(attempts)
         return data if isinstance(data, dict) else None
 
@@ -521,17 +554,8 @@ class WikiClient:
         return ranked[0][1]
 
     async def _recommend_weapon(self, size: int, role_key: str) -> dict[str, Any] | None:
-        style = {
-            "combat": "repeater",
-            "interceptor": "repeater",
-            "heavy_fighter": "cannon",
-            "stealth": "distortion",
-            "exploration": "cannon",
-            "multirole": "repeater",
-            "cargo": "cannon",
-        }.get(role_key, "repeater")
+        style = {"combat": "repeater", "interceptor": "repeater", "heavy_fighter": "cannon", "stealth": "distortion", "exploration": "cannon", "multirole": "repeater", "cargo": "cannon"}.get(role_key, "repeater")
         search_terms = WEAPON_TERMS.get(style, {}).get(size) or WEAPON_TERMS["repeater"].get(size) or []
-
         best: dict[str, Any] | None = None
         best_score = -1.0
         for term in search_terms:
@@ -547,7 +571,6 @@ class WikiClient:
             if score > best_score:
                 best_score = score
                 best = item
-
         if best is None:
             best = CURATED_WEAPONS.get(style, {}).get(size) or CURATED_WEAPONS["repeater"].get(size)
         return best
@@ -555,7 +578,6 @@ class WikiClient:
     async def _recommend_system(self, category: str, size: int, role_key: str) -> dict[str, Any] | None:
         profile = SYSTEM_TERMS.get(role_key) or SYSTEM_TERMS["multirole"]
         search_terms = profile.get(category, {}).get(size) or SYSTEM_TERMS["multirole"].get(category, {}).get(size) or []
-
         best: dict[str, Any] | None = None
         best_score = -1.0
         for term in search_terms:
@@ -571,7 +593,6 @@ class WikiClient:
             if score > best_score:
                 best_score = score
                 best = item
-
         if best is None:
             best = CURATED_SYSTEMS.get(category, {}).get(size)
         return best
@@ -610,24 +631,11 @@ class WikiClient:
 
     def _extract_missile_lines(self, vehicle: dict[str, Any]) -> list[str]:
         name = _norm(str(vehicle.get("name") or vehicle.get("game_name") or ""))
-        curated = {
-            "cutlass blue": ['4x S2 Missiles — Size 2 • Class Missiles'],
-            "shiv": ['S3 Missiles — Size 3 • Class Missiles', 'S2 Missiles — Size 2 • Class Missiles'],
-            "arrow": ['4x S2 Missiles — Size 2 • Class Missiles'],
-            "gladius": ['4x S3 Missiles — Size 3 • Class Missiles'],
-        }
+        curated = {"cutlass blue": ['4x S2 Missiles — Size 2 • Class Missiles'], "shiv": ['S3 Missiles — Size 3 • Class Missiles', 'S2 Missiles — Size 2 • Class Missiles'], "arrow": ['4x S2 Missiles — Size 2 • Class Missiles'], "gladius": ['4x S3 Missiles — Size 3 • Class Missiles']}
         return curated.get(name, [])
 
     def _shiv_fallback_vehicle(self) -> dict[str, Any]:
-        return {
-            "name": "Shiv",
-            "manufacturer": {"name": "Grey's Market"},
-            "role": "Combat • Heavy Fighter",
-            "health": 34300,
-            "shield_hp": 9000,
-            "cargo_capacity": 32,
-            "crew": {"max": 2},
-        }
+        return {"name": "Shiv", "manufacturer": {"name": "Grey's Market"}, "role": "Combat • Heavy Fighter", "health": 34300, "shield_hp": 9000, "cargo_capacity": 32, "crew": {"max": 2}}
 
     async def build_loadout_report(self, ship_name: str, requested_role: str | None = None) -> LoadoutReport | None:
         vehicle = await self.get_ship(ship_name)
