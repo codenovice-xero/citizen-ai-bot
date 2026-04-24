@@ -9,7 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from .config import settings
-from .loadout_engine import LoadoutEngine, ROLE_DISPLAY, ROLE_SYSTEM_PROFILE, ROLE_WEAPON_STYLE, SelectedItem
+from .loadout_engine import LoadoutEngine, ROLE_DISPLAY, ROLE_SYSTEM_PROFILE, SelectedItem
 from .models import LoadoutReport
 
 log = logging.getLogger(__name__)
@@ -79,7 +79,19 @@ def _walk_dicts(value: Any):
 
 def _text_blob(obj: dict[str, Any]) -> str:
     vals = []
-    for key in ("name", "type", "sub_type", "class", "class_name", "classification", "category", "item_type", "port_type"):
+    for key in (
+        "name",
+        "type",
+        "sub_type",
+        "class",
+        "class_name",
+        "classification",
+        "category",
+        "item_type",
+        "port_type",
+        "port_name",
+        "component_type",
+    ):
         val = obj.get(key)
         if val:
             vals.append(str(val))
@@ -91,7 +103,6 @@ def _size_from(obj: dict[str, Any]) -> int | None:
         size = _to_int(obj.get(key))
         if size:
             return size
-    # Sometimes size is embedded in strings like Size 3 or S3.
     blob = _text_blob(obj)
     match = re.search(r"(?:size\s*|\bs)([1-9])\b", blob)
     if match:
@@ -109,10 +120,11 @@ def _count_from(obj: dict[str, Any]) -> int:
 
 class WikiClient:
     """
-    Loadout v4:
-    - Internal DB remains authoritative for known ships.
-    - Unknown ships use Wiki API search/detail and a defensive hardpoint parser.
-    - Component selection still comes from Citizen AI's component database.
+    Live-provider loadout source.
+
+    Star Citizen Wiki vehicle data is authoritative for ship slots, hardpoints,
+    stats, and manufacturer data. Citizen AI's local component database is used
+    only to choose recommended parts that match the live slot size/category.
     """
 
     def __init__(self, timeout: float = 20.0) -> None:
@@ -242,26 +254,34 @@ class WikiClient:
         }
 
     def _infer_hardpoints(self, vehicle: dict[str, Any]) -> dict[str, list[dict[str, int]]]:
-        buckets: dict[str, Counter[int]] = {"weapons": Counter(), "missiles": Counter(), "shields": Counter(), "power": Counter(), "coolers": Counter()}
+        buckets: dict[str, Counter[int]] = {
+            "weapons": Counter(),
+            "missiles": Counter(),
+            "shields": Counter(),
+            "power": Counter(),
+            "coolers": Counter(),
+            "quantum_drives": Counter(),
+        }
         seen: set[tuple[str, int, str]] = set()
 
-        # Inspect top-level ports/components first, then limited recursive fallback.
         roots = []
-        for key in ("ports", "components", "parts", "hardpoints"):
+        for key in ("ports", "components", "parts", "hardpoints", "loadout"):
             roots.extend([x for x in _as_list(vehicle.get(key)) if isinstance(x, dict)])
         if not roots:
-            roots = list(_walk_dicts(vehicle))[:250]
+            roots = list(_walk_dicts(vehicle))[:350]
 
-        for obj in roots[:300]:
+        for obj in roots[:450]:
             blob = _text_blob(obj)
             size = _size_from(obj)
             if not size or size > 7:
                 continue
-            name = str(_first(obj.get("name"), obj.get("class_name"), obj.get("type"), obj.get("port_type")) or "")[:80]
+            name = str(_first(obj.get("name"), obj.get("class_name"), obj.get("type"), obj.get("port_type"), obj.get("port_name")) or "")[:100]
 
             category = None
             if any(x in blob for x in ("missile", "torpedo", "rack")):
                 category = "missiles"
+            elif "quantum" in blob and "drive" in blob:
+                category = "quantum_drives"
             elif any(x in blob for x in ("weapon", "gun", "cannon", "repeater", "gatling", "hardpoint")) and not any(x in blob for x in ("missile", "rack")):
                 category = "weapons"
             elif "shield" in blob:
@@ -279,8 +299,7 @@ class WikiClient:
             seen.add(key)
             buckets[category][size] += _count_from(obj)
 
-        # Defensive sanity caps to prevent recursive API trees from producing 40x weapons again.
-        caps = {"weapons": 12, "missiles": 32, "shields": 4, "power": 2, "coolers": 4}
+        caps = {"weapons": 16, "missiles": 48, "shields": 8, "power": 4, "coolers": 8, "quantum_drives": 2}
         out: dict[str, list[dict[str, int]]] = {}
         for category, counts in buckets.items():
             total = 0
@@ -302,6 +321,8 @@ class WikiClient:
             return profile["power"]
         if category == "coolers":
             return profile["cooler"]
+        if category == "quantum_drives":
+            return profile.get("quantum", "balanced")
         return "balanced"
 
     def _select_system(self, category: str, size: int, count: int, role: str) -> SelectedItem | None:
@@ -312,7 +333,7 @@ class WikiClient:
             item = by_size
         else:
             profile = self._profile_for_category(role, category)
-            item = by_size.get(profile) or by_size.get("balanced") or by_size.get("military") or next(iter(by_size.values()), None)
+            item = by_size.get(profile) or by_size.get("balanced") or by_size.get("military") or by_size.get("durable") or next(iter(by_size.values()), None)
         if not item:
             return None
         return SelectedItem(item["name"], int(item["size"]), item["class"], item.get("grade"), count, item.get("component_class"))
@@ -342,14 +363,14 @@ class WikiClient:
                 weapons.append(item)
 
         systems: list[SelectedItem] = []
-        for category in ("shields", "power", "coolers"):
+        for category in ("shields", "power", "coolers", "quantum_drives"):
             for slot in hp.get(category, []):
                 item = self._select_system(category, int(slot["size"]), int(slot["count"]), role)
                 if item:
                     systems.append(item)
 
-        weapon_lines = [x.line() for x in weapons] or ["Wiki returned ship stats, but no usable weapon hardpoints were exposed for this hull."]
-        system_lines = [x.line() for x in systems] or ["Wiki returned ship stats, but no usable system slots were exposed for this hull."]
+        weapon_lines = [x.line() for x in weapons] or ["Live Wiki data did not expose usable weapon hardpoints for this hull."]
+        system_lines = [x.line() for x in systems] or ["Live Wiki data did not expose usable system slots for this hull."]
 
         perf = []
         if total_dps:
@@ -369,26 +390,23 @@ class WikiClient:
         if not perf:
             perf.append("No performance stats were exposed cleanly by the Wiki API.")
 
-        notes = [f"Recommended role profile: {ROLE_DISPLAY.get(role, role.title())}"]
-        for key, label in (("weapons", "Weapons"), ("missiles", "Missiles"), ("shields", "Shields"), ("power", "Power"), ("coolers", "Coolers")):
+        notes = [
+            f"Recommended role profile: {ROLE_DISPLAY.get(role, role.title())}",
+            "Source: live Star Citizen Wiki ship data is authoritative for slot sizes/counts. Local data is not used as a ship fallback.",
+        ]
+        for key, label in (("weapons", "Weapons"), ("missiles", "Missiles"), ("shields", "Shields"), ("power", "Power"), ("coolers", "Coolers"), ("quantum_drives", "Quantum")):
             slots = hp.get(key, [])
             if slots:
                 notes.append(f"{label}: " + " • ".join(f"{s['count']}x S{s['size']}" for s in slots))
-        notes.append("Loadout v4 used live Wiki vehicle data because this ship is not yet in Citizen AI's internal ship database.")
+        notes.append("Loadout live-data mode: recommendations are selected only after live slot size/category parsing succeeds.")
 
         return LoadoutReport(name, ROLE_DISPLAY.get(role, role.title()), manufacturer, weapon_lines, system_lines, perf, notes)
 
     async def build_loadout_report(self, ship_name: str, requested_role: str | None = None) -> LoadoutReport | None:
-        known = self.engine.build(ship_name, requested_role)
-        if known is not None:
-            return known
         vehicle = await self._fetch_vehicle(ship_name)
         if not vehicle:
             return None
         return self._dynamic_report(vehicle, ship_name, requested_role)
 
     async def get_ship(self, ship_name: str) -> dict[str, Any] | None:
-        key = self.engine.resolve_ship_key(ship_name)
-        if key:
-            return self.engine.ship_db.get(key)
         return await self._fetch_vehicle(ship_name)
