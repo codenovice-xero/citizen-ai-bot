@@ -42,41 +42,13 @@ ROLE_SYSTEM_PROFILE = {
 }
 
 ROLE_META = {
-    "combat": {
-        "tier": "PvE/PvP general combat",
-        "priority": "repeaters, military shields, military power, heat stability",
-        "tactics": "Keep sustained pressure, avoid jousting, and disengage before shields collapse.",
-    },
-    "interceptor": {
-        "tier": "fast-response PvP/intercept",
-        "priority": "repeaters, fastest practical quantum drive, fast shield recovery",
-        "tactics": "Use speed to dictate range, punish fleeing targets, and avoid prolonged nose-to-nose trades.",
-    },
-    "heavy_fighter": {
-        "tier": "alpha-heavy brawler",
-        "priority": "laser cannons, military shields, military power, burst damage",
-        "tactics": "Trade deliberately, focus fire, and use higher alpha to punish predictable passes.",
-    },
-    "stealth": {
-        "tier": "low-signature ambush",
-        "priority": "distortion pressure, stealth systems, reduced signature profile",
-        "tactics": "Choose fights carefully, break contact often, and avoid extended capacitor races.",
-    },
-    "exploration": {
-        "tier": "range/survival expedition",
-        "priority": "durable shields, reliable power, efficient quantum drive",
-        "tactics": "Favor survivability and travel endurance over raw DPS.",
-    },
-    "multirole": {
-        "tier": "balanced daily-driver",
-        "priority": "balanced weapons, flexible shields, low-maintenance systems",
-        "tactics": "Works across contracts, light hauling, and general org operations.",
-    },
-    "cargo": {
-        "tier": "defensive hauling",
-        "priority": "durable shields, reliable systems, escape-focused quantum drive",
-        "tactics": "Survive long enough to spool, avoid combat commitment, and keep escorts nearby.",
-    },
+    "combat": {"tier": "PvE/PvP general combat", "priority": "repeaters, military shields, military power, heat stability", "tactics": "Keep sustained pressure, avoid jousting, and disengage before shields collapse."},
+    "interceptor": {"tier": "fast-response PvP/intercept", "priority": "repeaters, fastest practical quantum drive, fast shield recovery", "tactics": "Use speed to dictate range, punish fleeing targets, and avoid prolonged nose-to-nose trades."},
+    "heavy_fighter": {"tier": "alpha-heavy brawler", "priority": "laser cannons, military shields, military power, burst damage", "tactics": "Trade deliberately, focus fire, and use higher alpha to punish predictable passes."},
+    "stealth": {"tier": "low-signature ambush", "priority": "distortion pressure, stealth systems, reduced signature profile", "tactics": "Choose fights carefully, break contact often, and avoid extended capacitor races."},
+    "exploration": {"tier": "range/survival expedition", "priority": "durable shields, reliable power, efficient quantum drive", "tactics": "Favor survivability and travel endurance over raw DPS."},
+    "multirole": {"tier": "balanced daily-driver", "priority": "balanced weapons, flexible shields, low-maintenance systems", "tactics": "Works across contracts, light hauling, and general org operations."},
+    "cargo": {"tier": "defensive hauling", "priority": "durable shields, reliable systems, escape-focused quantum drive", "tactics": "Survive long enough to spool, avoid combat commitment, and keep escorts nearby."},
 }
 
 SHIP_ALIASES = {
@@ -98,6 +70,14 @@ SHIP_ALIASES = {
     "vanguard warden": "vanguard warden",
     "aegis vanguard warden": "vanguard warden",
 }
+
+WEAPON_GROUPS = (
+    ("weapons", "Pilot Weapons"),
+    ("slaved_weapons", "Slaved Weapons"),
+    ("turreted_weapons", "Turreted Weapons"),
+    ("remote_turrets", "Remote Turrets"),
+    ("manned_turrets", "Manned Turrets"),
+)
 
 
 def _norm(text: str | None) -> str:
@@ -125,9 +105,11 @@ class SelectedItem:
     component_class: str | None = None
     dps: float | None = None
     alpha: float | None = None
+    group_label: str | None = None
 
     def line(self) -> str:
         prefix = f"{self.count}x " if self.count > 1 else ""
+        group = f"[{self.group_label}] " if self.group_label else ""
         attrs = [f"Size {self.size}", f"Class {self.item_class}"]
         if self.component_class:
             attrs.append(f"Type {self.component_class}")
@@ -137,7 +119,7 @@ class SelectedItem:
             attrs.append(f"{_fmt_num(self.dps, 0)} DPS each")
         if self.alpha is not None:
             attrs.append(f"{_fmt_num(self.alpha, 0)} alpha")
-        return f"{prefix}{self.name} — {' • '.join(attrs)}"
+        return f"{group}{prefix}{self.name} — {' • '.join(attrs)}"
 
 
 class LoadoutEngine:
@@ -170,7 +152,7 @@ class LoadoutEngine:
         roles = self.available_roles(ship)
         return roles[0] if roles else "multirole"
 
-    def select_weapon(self, size: int, role: str) -> SelectedItem | None:
+    def select_weapon(self, size: int, role: str, group_label: str | None = None) -> SelectedItem | None:
         style = ROLE_WEAPON_STYLE.get(role, "repeater")
         weapons = self.component_db.get("weapons", {})
         item = (weapons.get(style) or {}).get(str(size))
@@ -180,14 +162,7 @@ class LoadoutEngine:
             item = (weapons.get("cannon") or {}).get(str(size))
         if item is None:
             return None
-        return SelectedItem(
-            name=item["name"],
-            size=int(item["size"]),
-            item_class=item["class"],
-            grade=item.get("grade"),
-            dps=item.get("dps"),
-            alpha=item.get("alpha"),
-        )
+        return SelectedItem(item["name"], int(item["size"]), item["class"], item.get("grade"), dps=item.get("dps"), alpha=item.get("alpha"), group_label=group_label)
 
     def _profile_for_category(self, role: str, category: str) -> str:
         profile = ROLE_SYSTEM_PROFILE.get(role, ROLE_SYSTEM_PROFILE["multirole"])
@@ -202,23 +177,10 @@ class LoadoutEngine:
             item = by_size
         else:
             profile = self._profile_for_category(role, category)
-            item = (
-                by_size.get(profile)
-                or by_size.get("balanced")
-                or by_size.get("military")
-                or by_size.get("durable")
-                or next(iter(by_size.values()), None)
-            )
+            item = by_size.get(profile) or by_size.get("balanced") or by_size.get("military") or by_size.get("durable") or next(iter(by_size.values()), None)
         if not item:
             return None
-        return SelectedItem(
-            name=item["name"],
-            size=int(item["size"]),
-            item_class=item["class"],
-            grade=item.get("grade"),
-            count=count,
-            component_class=item.get("component_class"),
-        )
+        return SelectedItem(item["name"], int(item["size"]), item["class"], item.get("grade"), count, item.get("component_class"))
 
     def select_missile(self, size: int, count: int) -> SelectedItem | None:
         item = (self.component_db.get("missiles", {}) or {}).get(str(size))
@@ -245,7 +207,7 @@ class LoadoutEngine:
         mobility_score = scm + (total_dps / 20)
         utility_score = cargo + (durability / 4000)
         lines = [
-            f"Meta Fit Score: {_fmt_num(combat_score if role in {'combat','heavy_fighter','stealth'} else mobility_score if role == 'interceptor' else utility_score, 0)}",
+            f"Meta Fit Score: {_fmt_num(combat_score if role in {'combat', 'heavy_fighter', 'stealth'} else mobility_score if role == 'interceptor' else utility_score, 0)}",
             f"Combat Score: {_fmt_num(combat_score, 0)}",
             f"Mobility Score: {_fmt_num(mobility_score, 0)}",
             f"Utility Score: {_fmt_num(utility_score, 0)}",
@@ -253,6 +215,35 @@ class LoadoutEngine:
         if durability:
             lines.append(f"Durability Index: {_fmt_num(durability, 0)}")
         return lines
+
+    def _select_weapon_groups(self, hardpoints: dict[str, Any], role: str) -> tuple[list[SelectedItem], float, float, list[str]]:
+        weapons: list[SelectedItem] = []
+        total_dps = 0.0
+        total_alpha = 0.0
+        notes: list[str] = []
+        for group_key, group_label in WEAPON_GROUPS:
+            slots = hardpoints.get(group_key, []) or []
+            if not slots:
+                continue
+            mounted_count = 0
+            group_dps = 0.0
+            group_alpha = 0.0
+            for slot in slots:
+                size = int(slot.get("size", 0))
+                count = int(slot.get("count", 1))
+                item = self.select_weapon(size, role, group_label=group_label)
+                if not item:
+                    continue
+                item.count = count
+                weapons.append(item)
+                mounted_count += count
+                group_dps += (item.dps or 0) * count
+                group_alpha += (item.alpha or 0) * count
+            if mounted_count:
+                total_dps += group_dps
+                total_alpha += group_alpha
+                notes.append(f"{group_label}: {mounted_count} mounts • {_fmt_num(group_dps, 0)} DPS • {_fmt_num(group_alpha, 0)} alpha")
+        return weapons, total_dps, total_alpha, notes
 
     def build(self, ship_name: str, role: str | None = None) -> LoadoutReport | None:
         ship_key = self.resolve_ship_key(ship_name)
@@ -265,18 +256,7 @@ class LoadoutEngine:
         stats = ship.get("stats", {})
         meta = ROLE_META[selected_role]
 
-        weapons: list[SelectedItem] = []
-        total_dps = 0.0
-        total_alpha = 0.0
-        for slot in hardpoints.get("weapons", []):
-            size = int(slot.get("size", 0))
-            count = int(slot.get("count", 1))
-            item = self.select_weapon(size, selected_role)
-            if item:
-                item.count = count
-                weapons.append(item)
-                total_dps += (item.dps or 0) * count
-                total_alpha += (item.alpha or 0) * count
+        weapons, total_dps, total_alpha, weapon_notes = self._select_weapon_groups(hardpoints, selected_role)
 
         for slot in hardpoints.get("missiles", []):
             item = self.select_missile(int(slot.get("size", 0)), int(slot.get("count", 1)))
@@ -293,10 +273,7 @@ class LoadoutEngine:
                 if item:
                     systems.append(item)
 
-        performance = [
-            f"Recommended weapon DPS: {_fmt_num(total_dps, 0)}",
-            f"Recommended alpha strike: {_fmt_num(total_alpha, 0)}",
-        ]
+        performance = [f"Recommended weapon DPS: {_fmt_num(total_dps, 0)}", f"Recommended alpha strike: {_fmt_num(total_alpha, 0)}"]
         if stats.get("hull_hp") is not None:
             performance.append(f"Hull HP: {_fmt_num(stats.get('hull_hp'), 0)}")
         if stats.get("shield_hp") is not None:
@@ -315,8 +292,9 @@ class LoadoutEngine:
             f"Recommended role profile: {ROLE_DISPLAY[selected_role]}",
             f"Build Priority: {meta['priority']}",
             f"Tactics: {meta['tactics']}",
+            *weapon_notes,
             f"System profile: shields={profile['shield']} • power={profile['power']} • cooling={profile['cooler']} • quantum={profile['quantum']}",
-            "Loadout v3: meta score, tactical role notes, quantum drive recommendation, Wiki ship data, and UEX enrichment hooks.",
+            "Loadout v4.2: all known pilot, slaved, turreted, remote turret, and manned turret weapon groups are included in recommendations and DPS totals.",
         ]
 
         return LoadoutReport(
