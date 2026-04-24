@@ -80,38 +80,42 @@ def _walk_dicts(value: Any):
 def _text_blob(obj: dict[str, Any]) -> str:
     vals = []
     for key in (
-        "name",
-        "type",
-        "sub_type",
-        "class",
-        "class_name",
-        "classification",
-        "category",
-        "item_type",
-        "port_type",
-        "port_name",
-        "component_type",
+        "name", "type", "sub_type", "class", "class_name", "classification", "category",
+        "item_type", "port_type", "port_name", "component_type", "component_class", "subtype",
+        "itemType", "item_type_label", "title", "subtitle", "display_name",
     ):
         val = obj.get(key)
         if val:
             vals.append(str(val))
+    item = obj.get("item") or obj.get("equipped") or obj.get("component")
+    if isinstance(item, dict):
+        vals.append(_text_blob(item))
     return " ".join(vals).lower()
 
 
 def _size_from(obj: dict[str, Any]) -> int | None:
-    for key in ("size", "port_size", "component_size", "item_size", "vehicle_weapon_size"):
+    for key in ("size", "port_size", "component_size", "item_size", "vehicle_weapon_size", "sizes"):
         size = _to_int(obj.get(key))
-        if size:
+        if size is not None:
             return size
+    item = obj.get("item") or obj.get("equipped") or obj.get("component")
+    if isinstance(item, dict):
+        nested = _size_from(item)
+        if nested is not None:
+            return nested
     blob = _text_blob(obj)
-    match = re.search(r"(?:size\s*|\bs)([1-9])\b", blob)
+    size_map = {"vehicle": 0, "small": 1, "medium": 2, "large": 3, "capital": 4}
+    for label, numeric in size_map.items():
+        if label in blob:
+            return numeric
+    match = re.search(r"(?:size\s*|\bs)([0-9])\b", blob)
     if match:
         return int(match.group(1))
     return None
 
 
 def _count_from(obj: dict[str, Any]) -> int:
-    for key in ("count", "quantity", "qty", "amount"):
+    for key in ("count", "quantity", "qty", "amount", "mounts"):
         val = _to_int(obj.get(key))
         if val and val > 0:
             return min(val, 16)
@@ -119,13 +123,7 @@ def _count_from(obj: dict[str, Any]) -> int:
 
 
 class WikiClient:
-    """
-    Live-provider loadout source.
-
-    Star Citizen Wiki vehicle data is authoritative for ship slots, hardpoints,
-    stats, and manufacturer data. Citizen AI's local component database is used
-    only to choose recommended parts that match the live slot size/category.
-    """
+    """Live Wiki data is authoritative for ship slot sizes/counts."""
 
     def __init__(self, timeout: float = 20.0) -> None:
         self._http = httpx.AsyncClient(
@@ -196,7 +194,6 @@ class WikiClient:
                 data = await self._json(path)
                 if isinstance(data, dict) and data:
                     return data
-
         matches = await self._vehicle_search(ship_name)
         if not matches:
             return None
@@ -253,53 +250,48 @@ class WikiClient:
             "crew": _to_int(_first(crew.get("max") if isinstance(crew, dict) else crew, vehicle.get("crew_max"))),
         }
 
+    def _classify_port(self, obj: dict[str, Any]) -> str | None:
+        blob = _text_blob(obj)
+        port_type = _norm(str(obj.get("type") or obj.get("port_type") or obj.get("item_type") or obj.get("itemType") or ""))
+        if any(x in blob for x in ("missile", "torpedo", "rack")):
+            return "missiles"
+        if "quantum" in blob and "drive" in blob:
+            return "quantum_drives"
+        if any(x in blob for x in ("shield generator", "shield_generator")) or port_type in {"shield", "shield generator", "shield_generator"}:
+            return "shields"
+        if any(x in blob for x in ("power plant", "power_plant")) or port_type in {"power", "power plant", "power_plant"}:
+            return "power"
+        if "cooler" in blob or "cooling" in blob or port_type in {"cooler", "coolers"}:
+            return "coolers"
+        if any(x in blob for x in ("weapon", "gun", "cannon", "repeater", "gatling", "hardpoint")) and not any(x in blob for x in ("missile", "rack")):
+            return "weapons"
+        return None
+
     def _infer_hardpoints(self, vehicle: dict[str, Any]) -> dict[str, list[dict[str, int]]]:
-        buckets: dict[str, Counter[int]] = {
-            "weapons": Counter(),
-            "missiles": Counter(),
-            "shields": Counter(),
-            "power": Counter(),
-            "coolers": Counter(),
-            "quantum_drives": Counter(),
-        }
+        buckets: dict[str, Counter[int]] = {k: Counter() for k in ("weapons", "missiles", "shields", "power", "coolers", "quantum_drives")}
         seen: set[tuple[str, int, str]] = set()
 
-        roots = []
+        roots: list[Any] = []
         for key in ("ports", "components", "parts", "hardpoints", "loadout"):
-            roots.extend([x for x in _as_list(vehicle.get(key)) if isinstance(x, dict)])
-        if not roots:
-            roots = list(_walk_dicts(vehicle))[:350]
+            roots.extend(_as_list(vehicle.get(key)))
+        source = roots if roots else [vehicle]
+        candidates = [x for x in _walk_dicts(source) if isinstance(x, dict)][:900]
 
-        for obj in roots[:450]:
-            blob = _text_blob(obj)
-            size = _size_from(obj)
-            if not size or size > 7:
-                continue
-            name = str(_first(obj.get("name"), obj.get("class_name"), obj.get("type"), obj.get("port_type"), obj.get("port_name")) or "")[:100]
-
-            category = None
-            if any(x in blob for x in ("missile", "torpedo", "rack")):
-                category = "missiles"
-            elif "quantum" in blob and "drive" in blob:
-                category = "quantum_drives"
-            elif any(x in blob for x in ("weapon", "gun", "cannon", "repeater", "gatling", "hardpoint")) and not any(x in blob for x in ("missile", "rack")):
-                category = "weapons"
-            elif "shield" in blob:
-                category = "shields"
-            elif "power" in blob:
-                category = "power"
-            elif "cooler" in blob or "cooling" in blob:
-                category = "coolers"
-
+        for obj in candidates:
+            category = self._classify_port(obj)
             if not category:
                 continue
+            size = _size_from(obj)
+            if size is None or size > 7:
+                continue
+            name = str(_first(obj.get("name"), obj.get("class_name"), obj.get("type"), obj.get("port_type"), obj.get("port_name"), obj.get("title")) or "")[:120]
             key = (category, size, name.lower())
             if key in seen:
                 continue
             seen.add(key)
             buckets[category][size] += _count_from(obj)
 
-        caps = {"weapons": 16, "missiles": 48, "shields": 8, "power": 4, "coolers": 8, "quantum_drives": 2}
+        caps = {"weapons": 20, "missiles": 64, "shields": 8, "power": 6, "coolers": 8, "quantum_drives": 2}
         out: dict[str, list[dict[str, int]]] = {}
         for category, counts in buckets.items():
             total = 0
@@ -311,6 +303,7 @@ class WikiClient:
                 safe_count = max(1, min(count, remaining))
                 out[category].append({"size": int(size), "count": int(safe_count)})
                 total += safe_count
+        log.info("Live Wiki slot parse: %s", {k: v for k, v in out.items() if v})
         return out
 
     def _profile_for_category(self, role: str, category: str) -> str:
@@ -353,10 +346,8 @@ class WikiClient:
             if item:
                 item.count = int(slot["count"])
                 weapons.append(item)
-                if item.dps:
-                    total_dps += item.dps * item.count
-                if item.alpha:
-                    total_alpha += item.alpha * item.count
+                total_dps += (item.dps or 0) * item.count
+                total_alpha += (item.alpha or 0) * item.count
         for slot in hp.get("missiles", []):
             item = self.engine.select_missile(int(slot["size"]), int(slot["count"]))
             if item:
@@ -392,13 +383,13 @@ class WikiClient:
 
         notes = [
             f"Recommended role profile: {ROLE_DISPLAY.get(role, role.title())}",
-            "Source: live Star Citizen Wiki ship data is authoritative for slot sizes/counts. Local data is not used as a ship fallback.",
+            "Source: live Star Citizen Wiki ship data is authoritative for slot sizes/counts. Local ship data is not used as fallback.",
         ]
         for key, label in (("weapons", "Weapons"), ("missiles", "Missiles"), ("shields", "Shields"), ("power", "Power"), ("coolers", "Coolers"), ("quantum_drives", "Quantum")):
             slots = hp.get(key, [])
             if slots:
                 notes.append(f"{label}: " + " • ".join(f"{s['count']}x S{s['size']}" for s in slots))
-        notes.append("Loadout live-data mode: recommendations are selected only after live slot size/category parsing succeeds.")
+        notes.append("Loadout live-data parser: recursively scans Wiki ports/components and only recommends parts after slot size/category parsing succeeds.")
 
         return LoadoutReport(name, ROLE_DISPLAY.get(role, role.title()), manufacturer, weapon_lines, system_lines, perf, notes)
 
