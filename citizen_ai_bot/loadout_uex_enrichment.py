@@ -1,22 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import re
 from typing import Any
 
 from .models import LoadoutReport
 
-_ITEM_PREFIX_RE = re.compile(r"^\s*(?:\d+x\s+)?(.+?)\s+—")
-_GENERIC_NAMES = {
-    "s1 missiles",
-    "s2 missiles",
-    "s3 missiles",
-    "s4 missiles",
-    "s5 missiles",
-    "s6 missiles",
-    "s7 missiles",
-    "s8 missiles",
-}
+_ITEM_PREFIX_RE = re.compile(r"^\s*(?:\[[^\]]+\]\s*)?(?:\d+x\s+)?(.+?)\s+—")
+_GENERIC_NAMES = {"s1 missiles", "s2 missiles", "s3 missiles", "s4 missiles", "s5 missiles", "s6 missiles", "s7 missiles", "s8 missiles"}
+_BLOCKED_DESCRIPTORS = ("armor", "helmet", "clothing", "legwear", "torso", "personal weapons", "medical", "food", "drink")
 
 
 def _extract_recommended_name(line: str) -> str | None:
@@ -27,6 +18,21 @@ def _extract_recommended_name(line: str) -> str | None:
     if not name or name.casefold() in _GENERIC_NAMES:
         return None
     return name
+
+
+def _scope_for_line(line: str) -> str:
+    lower = line.lower()
+    if "missile" in lower or "torpedo" in lower:
+        return "missile"
+    if "shield" in lower:
+        return "shield"
+    if "power plant" in lower:
+        return "power"
+    if "cooler" in lower:
+        return "cooler"
+    if "quantum drive" in lower:
+        return "quantum"
+    return "ship_weapon"
 
 
 def _uex_display_name(item: dict[str, Any]) -> str | None:
@@ -46,52 +52,49 @@ def _uex_descriptor(item: dict[str, Any]) -> str:
     return " • ".join(bits)
 
 
-async def enrich_loadout_report_with_uex(client: Any, report: LoadoutReport) -> LoadoutReport:
-    """
-    Cross-checks recommended loadout item names against UEX's item index.
+def _descriptor_is_safe(descriptor: str) -> bool:
+    lower = descriptor.lower()
+    return not any(term in lower for term in _BLOCKED_DESCRIPTORS)
 
-    The Wiki/local loadout engine remains responsible for ship stats, hardpoints,
-    and role scoring. UEX is used here as a second data source for catalog names
-    and item identity without making /loadout fail if UEX is unavailable.
-    """
-    recommended_names = []
+
+async def enrich_loadout_report_with_uex(client: Any, report: LoadoutReport) -> LoadoutReport:
+    """Cross-check recommended loadout components against UEX's scoped ship-component index."""
+    requested: list[tuple[str, str | None]] = []
     for line in [*report.weapons, *report.systems]:
         name = _extract_recommended_name(line)
-        if name and name not in recommended_names:
-            recommended_names.append(name)
+        if not name:
+            continue
+        pair = (name, _scope_for_line(line))
+        if pair not in requested:
+            requested.append(pair)
 
-    if not recommended_names:
-        report.notes.append("UEX source: no named components were available to cross-check.")
+    if not requested:
+        report.notes.append("UEX catalog match: no named ship components were available to cross-check.")
         return report
 
-    async def resolve(name: str) -> tuple[str, dict[str, Any] | None]:
-        try:
-            return name, await client.resolve_item(name)
-        except Exception:
-            return name, None
+    try:
+        if hasattr(client, "resolve_ship_components"):
+            resolved = await client.resolve_ship_components(requested)
+        else:
+            resolved = {name: await client.resolve_ship_component(name, scope=scope) for name, scope in requested}
+    except Exception:
+        report.notes.append("UEX catalog match: unavailable; loadout recommendations still used live ship slot data.")
+        return report
 
-    results = await asyncio.gather(*(resolve(name) for name in recommended_names))
     matched: list[str] = []
-    for requested, item in results:
+    for name, _scope in requested:
+        item = resolved.get(name)
         if not item:
             continue
         display = _uex_display_name(item)
-        if not display:
-            continue
         descriptor = _uex_descriptor(item)
-        if descriptor:
-            matched.append(f"{requested} → {display} ({descriptor})")
-        else:
-            matched.append(f"{requested} → {display}")
+        if not display or not _descriptor_is_safe(descriptor):
+            continue
+        matched.append(f"{name} → {display} ({descriptor})" if descriptor else f"{name} → {display}")
 
     if matched:
-        report.notes.append(
-            f"UEX catalog match: {len(matched)}/{len(recommended_names)} named components resolved."
-        )
+        report.notes.append(f"UEX catalog match: {len(matched)}/{len(requested)} named ship components resolved.")
         report.notes.extend(matched[:6])
     else:
-        report.notes.append(
-            "UEX catalog match: no recommended component names resolved; Wiki/local data was used as fallback."
-        )
-
+        report.notes.append("UEX catalog match: no safe ship-component matches found; suppressed broad item matches.")
     return report
